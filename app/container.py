@@ -21,6 +21,7 @@ from commands import (
     getapprovalrequest,
     getapprovalrequests,
     getapprovalslots,
+    getreceiveroute,
     getrequestid,
     getretractable,
     getretractableid,
@@ -86,6 +87,7 @@ class ServiceContainer:
         "getretractable": getretractable,
         "getretractables": getretractables,
         "getretractableid": getretractableid,
+        "getreceiveroute": getreceiveroute,
         # Advisory, node-local, and engine-driving -- rate-limited accordingly
         # in server.py.
         "getapprovalslots": getapprovalslots,

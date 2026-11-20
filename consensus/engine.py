@@ -33,6 +33,16 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .receive_routes import (
+    CREDIT_ORDINARY_TRANSFER,
+    RECEIVE_ROUTE_TX_TYPES,
+    TX_TYPE_INSTALL_RECEIVE_ROUTE,
+    ReceiveRouteBook,
+    ReceiveRouteShapeError,
+    destination_authorized as route_destination_authorized,
+    parse_install_receive_route,
+    parse_remove_receive_route,
+)
 from .retractable import (
     RETRACTABLE_TX_TYPES,
     RetractableBook,
@@ -72,6 +82,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     {"user_tx", TX_TYPE_APPROVAL_REQUEST, TX_TYPE_RETRACTABLE_TRANSFER,
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
+    | set(RECEIVE_ROUTE_TX_TYPES)
 )
 
 
@@ -224,6 +235,17 @@ class ConsensusEngine(ABC):
 def _retractable_book(lm) -> Optional[RetractableBook]:
     book = getattr(lm, "retractable_transfers", None)
     return book if isinstance(book, RetractableBook) else None
+
+
+def _receive_route_book(lm) -> Optional[ReceiveRouteBook]:
+    """The receive-route book, or None when the manager does not carry one.
+
+    The isinstance guard is load-bearing: test doubles and pre-feature
+    managers answer any attribute with a stand-in, and a stand-in must mean
+    "no routes" (the legacy behavior), never a phantom split.
+    """
+    book = getattr(lm, "receive_routes", None)
+    return book if isinstance(book, ReceiveRouteBook) else None
 
 
 def _escrow_total(lm) -> int:
@@ -963,6 +985,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 retractable_events.append(event)
         retractable_events.extend((rid, "released") for rid in released_retractables)
 
+        # Routing receipts (#35): the distinct atomic record of every split
+        # this block applied, in transaction order — gross, net and routed
+        # amounts per route, carried on the snapshot exactly as the
+        # retractable events are, for history to record.
+        routing_events = []
+        for i, tx in enumerate(block.transactions):
+            entries = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "routing"
+            )
+            if entries and id(tx) in accepted_obj:
+                routing_events.extend(entries)
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1118,6 +1152,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "consensus_rules_state": next_cons_rules,
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
+                "routing_events": routing_events,
             }
         )
         
@@ -1131,6 +1166,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "activated_updates": [u.update_id_hex for u in newly_active],
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
+                "routing_events": routing_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1664,6 +1700,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             parked_rule_change_id: Optional[bytes] = None
             pending_retractable_park = None
             pending_retract_id: Optional[bytes] = None
+            # Receive-route mutations are deferred to the same post-settlement
+            # site as the retractable park: the branch validates against the
+            # tx fork, but the book changes only once the tx is known to stay
+            # accepted (its fee paid), so a rejected install leaves no route.
+            pending_route_install = None
+            pending_route_removal = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -1882,7 +1924,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
             def _execute_fee_era_transfer(from_addr, to_addr, amount_val,
                                           slot_values=None, overrides=None,
-                                          escrow=False):
+                                          escrow=False,
+                                          credit_class=CREDIT_ORDINARY_TRANSFER):
                 """Execute ONE transfer under the fee model. True to continue.
 
                 Extracted verbatim from the user_tx transfer loop so the
@@ -1904,6 +1947,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
 
                 `escrow` stages only the debit: the credit belongs to the
                 retractable book until it releases.
+
+                `credit_class` names what kind of credit this is for the
+                receive-route book (#35). Every current caller is an ordinary
+                transfer (the vote-release path completes one), which is the
+                default; a future node-made credit through this seam must
+                pass its own class explicitly, because only ordinary
+                transfers and claimed payments may trigger a route.
                 """
                 nonlocal accepted_in_block, hard_reject, execution_success
                 try:
@@ -2018,7 +2068,49 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         return False
                     staged_writes[from_addr] = current_from - amount
                     if not escrow:
-                        staged_writes[to_addr] = _read_bal(to_addr) + amount
+                        # --- Receive routes (#35) ---
+                        # The recipient's route splits the credit HERE, in
+                        # the same staged write set, so gross/net/routed
+                        # commit with the transfer or not at all, and no
+                        # transfer path can bypass the route. The split adds
+                        # no evaluation, so the transfer still measures
+                        # exactly one fee. The routed share is staged
+                        # directly to the destination: it never re-enters
+                        # this seam as a credit, and its class
+                        # (route_output) never triggers a route — routing is
+                        # single-hop by construction, not by counter.
+                        route_book = _receive_route_book(lifecycle_mgr)
+                        application = (
+                            route_book.apply_route(
+                                to_addr, amount, credit_class,
+                                int(block_timestamp or 0),
+                            )
+                            if route_book is not None else None
+                        )
+                        if application is not None and application.applied:
+                            staged_writes[to_addr] = (
+                                _read_bal(to_addr) + application.net
+                            )
+                            staged_writes[application.destination_pubkey] = (
+                                _read_bal(application.destination_pubkey)
+                                + application.routed
+                            )
+                            tx_receipt.setdefault("routing", []).append({
+                                "route_id": application.route_id.hex(),
+                                "owner_pubkey": to_addr,
+                                "destination_pubkey": application.destination_pubkey,
+                                "gross": amount,
+                                "routed": application.routed,
+                                "net": application.net,
+                            })
+                            tx_receipt["logs"].append(
+                                f"Routing: gross {amount} -> net {application.net} "
+                                f"to {str(to_addr)[:10]}..., routed {application.routed} "
+                                f"to {str(application.destination_pubkey)[:10]}... "
+                                f"(route {application.route_id.hex()[:16]})"
+                            )
+                        else:
+                            staged_writes[to_addr] = _read_bal(to_addr) + amount
                 except FeeRuleError:
                     raise
                 except Exception as e:
@@ -2628,6 +2720,66 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Retractable transfer retracted: " + request.retractable_id.hex()
                             )
 
+            elif tx_type in RECEIVE_ROUTE_TX_TYPES:
+                # Nothing here reads nested `payload`: only root fields are
+                # signed, so anything else is unsigned data. Validation runs
+                # against this transaction's lifecycle fork through the book's
+                # own can_install/can_remove (the same functions admission
+                # calls), and the mutation itself is deferred to the
+                # post-settlement site below, so a tx whose fee is never paid
+                # installs and removes nothing.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    route_book = _lifecycle_for_write().receive_routes
+                    if tx_type == TX_TYPE_INSTALL_RECEIVE_ROUTE:
+                        try:
+                            route = parse_install_receive_route(tx)
+                        except ReceiveRouteShapeError as exc:
+                            route = None
+                            reason = f"invalid receive route ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != route.owner_pubkey:
+                                reason = "sender is not the route owner"
+                            else:
+                                _, reason = route_book.can_install(
+                                    route, int(block_timestamp or 0)
+                                )
+                        if route is None or reason:
+                            tx_receipt["logs"].append(f"Receive route install ignored: {reason}")
+                            tx_receipt["reason"] = "receive_route_not_installed"
+                            accepted_in_block = False
+                        else:
+                            pending_route_install = route
+                            tx_receipt["logs"].append(
+                                "Receive route install staged: " + route.route_id.hex()
+                            )
+                    else:  # TX_TYPE_REMOVE_RECEIVE_ROUTE
+                        try:
+                            route_owner = parse_remove_receive_route(tx)
+                        except ReceiveRouteShapeError as exc:
+                            route_owner = None
+                            reason = f"invalid receive route removal ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != route_owner:
+                                reason = "sender is not the route owner"
+                            else:
+                                authorized = route_destination_authorized(
+                                    tx, route_book.get(route_owner)
+                                )
+                                _, reason = route_book.can_remove(
+                                    route_owner, int(block_timestamp or 0),
+                                    destination_authorized=authorized,
+                                )
+                        if route_owner is None or reason:
+                            tx_receipt["logs"].append(f"Receive route removal ignored: {reason}")
+                            tx_receipt["reason"] = "receive_route_not_removed"
+                            accepted_in_block = False
+                        else:
+                            pending_route_removal = (route_owner, authorized)
+                            tx_receipt["logs"].append(
+                                "Receive route removal staged: " + route_owner[:10] + "..."
+                            )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3174,6 +3326,31 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 elif pending_retract_id is not None:
                     tx_receipt["retractable_event"] = (pending_retract_id.hex(), "retracted")
                     book.retract(pending_retract_id)
+                if pending_route_install is not None or pending_route_removal is not None:
+                    route_book = _lifecycle_for_write().receive_routes
+                if pending_route_install is not None:
+                    # Re-checked by install() itself: the fork state the
+                    # branch validated is the state committed here, because
+                    # nothing else in this tx can touch the route book.
+                    route_book.install(
+                        pending_route_install, int(block_timestamp or 0)
+                    )
+                    tx_receipt["route_event"] = (
+                        pending_route_install.route_id.hex(), "installed"
+                    )
+                    tx_receipt["logs"].append(
+                        "Receive route installed: " + pending_route_install.route_id.hex()
+                    )
+                elif pending_route_removal is not None:
+                    removed_owner, removed_authorized = pending_route_removal
+                    removed_route = route_book.remove(
+                        removed_owner, int(block_timestamp or 0),
+                        destination_authorized=removed_authorized,
+                    )
+                    tx_receipt["route_event"] = (removed_route.route_id.hex(), "removed")
+                    tx_receipt["logs"].append(
+                        "Receive route removed: " + removed_route.route_id.hex()
+                    )
 
             # Commit staged balance writes only for txs that stay accepted.
             # (Replay soft-fails intentionally commit partial stages — same

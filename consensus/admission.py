@@ -48,6 +48,16 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.receive_routes import (
+    TX_TYPE_INSTALL_RECEIVE_ROUTE,
+    TX_TYPE_REMOVE_RECEIVE_ROUTE,
+    ReceiveRouteBook,
+    ReceiveRouteEntry,
+    ReceiveRouteShapeError,
+    destination_authorized,
+    parse_install_receive_route,
+    parse_remove_receive_route,
+)
 from consensus.retractable import (
     KIND_HEIGHT,
     MAX_OPEN_RETRACTABLE_PER_SENDER,
@@ -1618,6 +1628,101 @@ def validate_retract_transfer_payload(
     return success({"retractable_id": request.retractable_id.hex()})
 
 
+# --- Receive routes ------------------------------------------------------------
+
+def _tip_route_book(tip_view: TipAdmissionView, owner_pubkey: str) -> ReceiveRouteBook:
+    """A book holding exactly the tip's route for `owner_pubkey` (if any).
+
+    Admission and apply must reach the same verdict, and the verdict lives in
+    the book's can_install/can_remove; rebuilding the one-entry book from the
+    tip view lets admission call them verbatim instead of re-implementing
+    the version and lock rules a second time.
+    """
+    book = ReceiveRouteBook()
+    row = tip_view.get_receive_route(owner_pubkey)
+    if row is not None:
+        entry = ReceiveRouteEntry(
+            owner_pubkey=row["owner_pubkey"],
+            destination_pubkey=row["destination_pubkey"],
+            bps=int(row["bps"]),
+            min_amount=int(row["min_amount"]),
+            activation_ts=int(row["activation_ts"]),
+            expiry_ts=int(row["expiry_ts"]),
+            locked_until_ts=int(row["locked_until_ts"]),
+            version=int(row["version"]),
+        )
+        book = ReceiveRouteBook.restore([(
+            entry.route_id, entry.owner_pubkey, entry.destination_pubkey,
+            entry.bps, entry.min_amount, entry.activation_ts, entry.expiry_ts,
+            entry.locked_until_ts, entry.version,
+        )])
+    return book
+
+
+def validate_install_receive_route_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for installing (or replacing) a receive route (#35).
+
+    Shape and state checks are the book's own (`can_install` against the
+    tip's one-entry book), shared with block apply verbatim.
+    """
+    try:
+        route = parse_install_receive_route(tx)
+    except ReceiveRouteShapeError as exc:
+        return format_error(f"Malformed install_receive_route: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != route.owner_pubkey:
+        return format_error("install_receive_route sender_pubkey must match the signer.")
+
+    err = validate_bls_pubkey(route.destination_pubkey, "route_destination_pubkey")
+    if err:
+        return format_error(f"install_receive_route rejected: {err}")
+
+    book = _tip_route_book(tip_view, route.owner_pubkey)
+    ok, reason = book.can_install(route, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"install_receive_route rejected: {reason}")
+
+    return success({"route_id": route.route_id.hex()})
+
+
+def validate_remove_receive_route_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a receive route (#35).
+
+    A locked route needs the destination's authorization, verified by the
+    same helper block apply uses, or the lock must have run out — the book
+    decides, admission only presents the tip state.
+    """
+    try:
+        owner = parse_remove_receive_route(tx)
+    except ReceiveRouteShapeError as exc:
+        return format_error(f"Malformed remove_receive_route: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error("remove_receive_route sender_pubkey must match the signer.")
+
+    book = _tip_route_book(tip_view, owner)
+    entry = book.get(owner)
+    if entry is None:
+        return format_error(
+            "No receive route installed for this account.",
+            code="UNKNOWN_RECEIVE_ROUTE",
+        )
+    ok, reason = book.can_remove(
+        owner, tip_view.next_block_timestamp,
+        destination_authorized=destination_authorized(tx, entry),
+    )
+    if not ok:
+        return format_error(f"remove_receive_route rejected: {reason}")
+
+    return success({"route_id": entry.route_id.hex()})
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -1728,6 +1833,12 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
          return validate_retract_transfer_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_INSTALL_RECEIVE_ROUTE:
+         return validate_install_receive_route_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_REMOVE_RECEIVE_ROUTE:
+         return validate_remove_receive_route_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

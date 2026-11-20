@@ -5,8 +5,8 @@ ordinary credit it receives is routed to one destination, atomically with the
 credit itself — no wallet needs to be online at receipt time. This module is
 the book: the pure consensus state, its validation, and the split arithmetic.
 The engine hook that stages the split inside `_execute_fee_era_transfer`
-lands in a later slice; everything the hook needs is decided here, so
-admission and apply can never disagree about a route.
+consults `apply_route` and nothing else, so admission and apply can never
+disagree about a route.
 
 CONSENSUS-FROZEN SURFACE
 ------------------------
@@ -104,13 +104,18 @@ class RouteApplication:
     """The outcome of presenting one credit to the book.
 
     `applied` False means the credit lands whole: `routed` is 0 and `net` is
-    the gross. `reason` names why, for receipts and tests.
+    the gross. `reason` names why, for receipts and tests. When applied,
+    `destination_pubkey` and `route_id` identify the route that split the
+    credit, so the engine can stage the routed share and write the routing
+    receipt without a second lookup.
     """
 
     applied: bool
     routed: int
     net: int
     reason: str
+    destination_pubkey: str = ""
+    route_id: bytes = b""
 
 
 def split_credit(gross: int, bps: int) -> Tuple[int, int]:
@@ -260,6 +265,9 @@ class ReceiveRouteBook:
     def route_count(self) -> int:
         return len(self._routes)
 
+    def is_empty(self) -> bool:
+        return not self._routes
+
     def root(self) -> bytes:
         if self._root is None:
             self._root = compute_receive_route_book_root(self.rows())
@@ -366,4 +374,88 @@ class ReceiveRouteBook:
         routed, net = split_credit(gross, entry.bps)
         if routed == 0:
             return RouteApplication(False, 0, gross, "share rounds to zero")
-        return RouteApplication(True, routed, net, "routed")
+        return RouteApplication(
+            True, routed, net, "routed",
+            destination_pubkey=entry.destination_pubkey,
+            route_id=entry.route_id,
+        )
+
+
+# --- Removal authorization ----------------------------------------------------
+#
+# A locked route binds the recipient for its term (gmikeyg on #35): the owner
+# alone cannot remove or replace it early. The early-release path is the
+# destination's BLS signature over a domain-separated message naming the
+# owner and the exact route id, so an authorization lifted from one route
+# releases no other. Verified the same way transaction signatures are
+# (consensus.bls.verify over the sha256 digest), and shared by admission and
+# apply so the two can never disagree about whether a removal is authorized.
+
+REMOVE_AUTHORIZATION_DOMAIN = b"tau.receive_route.remove_authorization.v1"
+
+
+def parse_remove_receive_route(tx: Dict[str, Any]) -> str:
+    """Read a removal's owner from ROOT fields only; returns the owner pubkey."""
+    if not isinstance(tx, dict):
+        raise ReceiveRouteShapeError("transaction must be an object")
+    return _pubkey_field(tx, "sender_pubkey")
+
+
+def remove_authorization_message(owner_pubkey: str, route_id: bytes) -> bytes:
+    return (
+        REMOVE_AUTHORIZATION_DOMAIN
+        + bytes.fromhex(owner_pubkey)
+        + bytes(route_id)
+    )
+
+
+def destination_authorized(tx: Dict[str, Any], entry: Optional[ReceiveRouteEntry]) -> bool:
+    """True when `tx` carries the destination's signature releasing `entry`.
+
+    Never raises: a malformed or absent signature is simply not an
+    authorization, because this runs inside block apply.
+    """
+    if entry is None:
+        return False
+    signature = tx.get("route_destination_signature") if isinstance(tx, dict) else None
+    if not isinstance(signature, str):
+        return False
+    try:
+        import hashlib
+
+        from consensus import bls
+
+        digest = hashlib.sha256(
+            remove_authorization_message(entry.owner_pubkey, entry.route_id)
+        ).digest()
+        return bool(
+            bls.verify(
+                bytes.fromhex(entry.destination_pubkey),
+                digest,
+                bytes.fromhex(signature),
+            )
+        )
+    except Exception:
+        return False
+
+
+# --- Capability reporting -------------------------------------------------------
+
+
+def route_capabilities() -> Dict[str, Any]:
+    """The route semantics a capability endpoint reports, from the constants.
+
+    Built from the module's own values so the report can never drift from
+    the code: if a bound changes, this record changes with it. (#35 case 8:
+    support, credit classes, rounding and fee semantics, stated before send.)
+    """
+    return {
+        "supported": True,
+        "trigger_credit_classes": sorted(ROUTE_TRIGGER_CREDIT_CLASSES),
+        "rounding": "floor",
+        "fee": "one original transfer fee; the split adds no fee event",
+        "max_bps": MAX_ROUTE_BPS,
+        "product_cap_bps": PRODUCT_CAP_BPS,
+        "locked_route_expiry": "mandatory",
+        "single_hop": "route outputs never trigger a route",
+    }

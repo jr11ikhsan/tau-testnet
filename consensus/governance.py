@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
+from consensus.receive_routes import ReceiveRouteBook
 from consensus.retractable import RetractableBook
 
 logger = logging.getLogger(__name__)
@@ -197,6 +198,7 @@ def build_mechanism_metadata(
     approval_requests_root: str = "",
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
+    receive_routes_root: str = "",
     faucet_amount: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
@@ -243,6 +245,12 @@ def build_mechanism_metadata(
     if retractable_transfers_root is None:
         retractable_transfers_root = RetractableBook().root().hex()
     mech["retractable_transfers_root"] = retractable_transfers_root
+    # Receive routes (#35): same non-default gate as rule offers. The key is
+    # emitted only once a route exists, so a chain that never installs one
+    # hashes exactly as it did before the field existed, and gen_genesis
+    # (which calls this without it) is unaffected.
+    if receive_routes_root:
+        mech["receive_routes_root"] = receive_routes_root
     return mech
 
 
@@ -451,6 +459,10 @@ class ConsensusLifecycleManager:
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
         self.retractable_transfers = RetractableBook()
+        # Receive routes (#35). A FIELD for the same reason rule_offers is:
+        # the transfer seam reads it on the manager every node already shares,
+        # and consensus_meta_hash binds its root once a route exists.
+        self.receive_routes = ReceiveRouteBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -545,6 +557,10 @@ class ConsensusLifecycleManager:
             ),
             approval_slots_active=self.approval_slots_active,
             retractable_transfers_root=self.retractable_transfers.root().hex(),
+            receive_routes_root=(
+                "" if self.receive_routes.is_empty()
+                else self.receive_routes.root().hex()
+            ),
             faucet_amount=self.faucet_amount,
         )
         return compute_consensus_meta_hash(
