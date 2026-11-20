@@ -33,6 +33,11 @@ from consensus.approvals import (
     TX_TYPE_RULE_CHANGE_REQUEST,
     TX_TYPE_TRANSFER_VOTE,
 )
+from consensus.payout_rules import (
+    TX_TYPE_EXECUTE_PAYOUT_RULE,
+    TX_TYPE_INSTALL_PAYOUT_RULE,
+    TX_TYPE_REMOVE_PAYOUT_RULE,
+)
 from consensus.receive_routes import (
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
     TX_TYPE_REMOVE_RECEIVE_ROUTE,
@@ -178,6 +183,32 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # authorization; the terms executed are the book's, never the
         # submitter's, so there is nothing else to sign.
         signing_dict["standing_auth_id"] = payload.get("standing_auth_id")
+    elif tx_type == TX_TYPE_INSTALL_PAYOUT_RULE:
+        # Every field that fixes the rule is signed: the declared recipient
+        # set, the leg program, both caps and the period shape. The apply
+        # path installs exactly these root fields, so anything omitted here
+        # could be rewritten by a proposer into a different rule than the
+        # owner chose — above all the recipients and the caps.
+        signing_dict["payout_recipients"] = payload.get("payout_recipients")
+        signing_dict["payout_legs"] = payload.get("payout_legs")
+        signing_dict["payout_max_per_execution"] = payload.get("payout_max_per_execution")
+        signing_dict["payout_max_per_period"] = payload.get("payout_max_per_period")
+        signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
+        signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
+        signing_dict["payout_version"] = payload.get("payout_version")
+    elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
+        # Nothing beyond the signer's identity (sender_pubkey is always
+        # signed): a removal names the signer's own rule, and there is no
+        # field a proposer could rewrite to redirect it.
+        pass
+    elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
+        # The execution's inputs are signed: which rule, which settlement,
+        # and the base amount the stored program computes over. The legs
+        # themselves are the book's computation, never the submitter's, so
+        # there is nothing else to sign.
+        signing_dict["payout_rule_id"] = payload.get("payout_rule_id")
+        signing_dict["payout_settlement_id"] = payload.get("payout_settlement_id")
+        signing_dict["payout_base_amount"] = payload.get("payout_base_amount")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

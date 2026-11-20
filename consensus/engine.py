@@ -33,8 +33,20 @@ from .approvals import (
     parse_rule_change_request_checked,
     parse_transfer_vote,
 )
+from .payout_rules import (
+    PAYOUT_RULE_TX_TYPES,
+    TX_TYPE_EXECUTE_PAYOUT_RULE,
+    TX_TYPE_INSTALL_PAYOUT_RULE,
+    TX_TYPE_REMOVE_PAYOUT_RULE,
+    PayoutRuleBook,
+    PayoutRuleShapeError,
+    parse_execute_payout_rule,
+    parse_install_payout_rule,
+    parse_remove_payout_rule,
+)
 from .receive_routes import (
     CREDIT_ORDINARY_TRANSFER,
+    CREDIT_PAYOUT_LEG,
     CREDIT_STANDING_EXECUTION,
     RECEIVE_ROUTE_TX_TYPES,
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
@@ -96,6 +108,7 @@ FEE_BEARING_TX_TYPES = frozenset(
     | set(RULE_OFFER_TX_TYPES)
     | set(RECEIVE_ROUTE_TX_TYPES)
     | set(STANDING_PAYMENT_TX_TYPES)
+    | set(PAYOUT_RULE_TX_TYPES)
 )
 
 
@@ -270,6 +283,17 @@ def _standing_payment_book(lm) -> Optional[StandingPaymentBook]:
     """
     book = getattr(lm, "standing_payments", None)
     return book if isinstance(book, StandingPaymentBook) else None
+
+
+def _payout_rule_book(lm) -> Optional[PayoutRuleBook]:
+    """The payout-rule book, or None when the manager does not carry one.
+
+    The same isinstance guard as `_receive_route_book`, for the same
+    reason: a stand-in manager must mean "no payout rules" (the legacy
+    behavior), never a phantom rule.
+    """
+    book = getattr(lm, "payout_rules", None)
+    return book if isinstance(book, PayoutRuleBook) else None
 
 
 def _escrow_total(lm) -> int:
@@ -1032,6 +1056,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 standing_payment_events.append(event)
 
+        # Payout-rule events (#63): installs, removals and executions that
+        # stayed accepted, in transaction order — carried on the snapshot
+        # exactly as the standing-payment events are, for history to record.
+        payout_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "payout_event"
+            )
+            if event and id(tx) in accepted_obj:
+                payout_events.append(event)
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1189,6 +1224,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
+                "payout_events": payout_events,
             }
         )
         
@@ -1204,6 +1240,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "routing_events": routing_events,
                 "standing_payment_events": standing_payment_events,
+                "payout_events": payout_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1751,6 +1788,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             pending_standing_create = None
             pending_standing_cancel = None
             pending_standing_execution = None
+            # Payout-rule mutations defer to the same post-settlement site,
+            # for the same reason: an install whose fee is never paid
+            # installs no rule, and an execution records its settlement and
+            # advances its period total only once every leg it staged is
+            # known to stay in the block.
+            pending_payout_install = None
+            pending_payout_removal = None
+            pending_payout_execution = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2970,6 +3015,133 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         + sp_auth_id.hex()
                                     )
 
+            elif tx_type in PAYOUT_RULE_TX_TYPES:
+                # Nothing here reads nested `payload`: only root fields are
+                # signed, so anything else is unsigned data. Validation runs
+                # against this transaction's lifecycle fork through the
+                # book's own can_install/can_remove/evaluate_execution (the
+                # same functions admission calls), and every mutation is
+                # deferred to the post-settlement site below, so a tx whose
+                # fee is never paid installs, removes and settles nothing.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    pr_book = _lifecycle_for_write().payout_rules
+                    pr_ts = int(block_timestamp or 0)
+                    if tx_type == TX_TYPE_INSTALL_PAYOUT_RULE:
+                        try:
+                            pr_entry = parse_install_payout_rule(tx)
+                        except PayoutRuleShapeError as exc:
+                            pr_entry = None
+                            reason = f"invalid payout rule ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != pr_entry.owner_pubkey:
+                                reason = "sender is not the rule owner"
+                            else:
+                                _, reason = pr_book.can_install(pr_entry, pr_ts)
+                        if pr_entry is None or reason:
+                            tx_receipt["logs"].append(f"Payout rule install ignored: {reason}")
+                            tx_receipt["reason"] = "payout_rule_not_installed"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_install = pr_entry
+                            tx_receipt["logs"].append(
+                                "Payout rule install staged: " + pr_entry.rule_id.hex()
+                            )
+                    elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
+                        try:
+                            pr_owner = parse_remove_payout_rule(tx)
+                        except PayoutRuleShapeError as exc:
+                            pr_owner = None
+                            reason = f"invalid payout rule removal ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != pr_owner:
+                                reason = "sender is not the rule owner"
+                            else:
+                                _, reason = pr_book.can_remove(pr_owner, pr_ts)
+                        if pr_owner is None or reason:
+                            tx_receipt["logs"].append(f"Payout rule removal ignored: {reason}")
+                            tx_receipt["reason"] = "payout_rule_not_removed"
+                            accepted_in_block = False
+                        else:
+                            pending_payout_removal = pr_owner
+                            tx_receipt["logs"].append(
+                                "Payout rule removal staged: " + pr_owner[:10] + "..."
+                            )
+                    else:  # TX_TYPE_EXECUTE_PAYOUT_RULE
+                        try:
+                            pr_rule_id, pr_settlement_id, pr_base = parse_execute_payout_rule(tx)
+                        except PayoutRuleShapeError as exc:
+                            pr_rule_id = None
+                            pr_entry = None
+                            pr_decision = None
+                            pr_balance = 0
+                            reason = f"invalid payout rule execution ({exc})"
+                        else:
+                            pr_entry = pr_book.get_by_id(pr_rule_id)
+                            if pr_entry is None:
+                                pr_decision = None
+                                pr_balance = 0
+                                reason = "no payout rule with this id"
+                            else:
+                                # The book computes the legs from the
+                                # stored program and the submitted inputs,
+                                # and checks them against the declared set,
+                                # both caps and the owner's balance as this
+                                # tx sees it; the transfers below then move
+                                # exactly those legs through the ordinary
+                                # seam, so the owner's o5 is re-checked on
+                                # every real recipient and amount by the
+                                # same evaluation an ordinary transfer of
+                                # theirs would face.
+                                pr_balance = _read_bal(pr_entry.owner_pubkey)
+                                pr_decision = pr_book.evaluate_execution(
+                                    pr_rule_id, pr_settlement_id, pr_base,
+                                    pr_ts, pr_balance,
+                                )
+                                reason = "" if pr_decision.executed else pr_decision.reason
+                        if pr_rule_id is None or reason:
+                            tx_receipt["logs"].append(f"Payout rule execution ignored: {reason}")
+                            tx_receipt["reason"] = "payout_rule_not_executed"
+                            accepted_in_block = False
+                        else:
+                            # Settle every leg through the normal transfer
+                            # path: the policy gates, the balance check and
+                            # the fee measurement are the seam's own, once
+                            # per leg, exactly as a multi-transfer user_tx
+                            # is charged. Each credit carries the payout-leg
+                            # class, so a receive route never splits it
+                            # (the design's credit-class table) — the seam
+                            # stages it whole. No custom inputs: the
+                            # submitter's inputs must not steer the owner's
+                            # policy evaluation; the legs are the stored
+                            # program's, never the submitter's.
+                            all_moved = True
+                            for leg_recipient, leg_amount in pr_decision.legs:
+                                moved = _execute_fee_era_transfer(
+                                    pr_entry.owner_pubkey, leg_recipient,
+                                    leg_amount,
+                                    slot_values=_approval_slot_values(),
+                                    overrides={},
+                                    credit_class=CREDIT_PAYOUT_LEG,
+                                )
+                                if not moved:
+                                    all_moved = False
+                                    break
+                            # The fees were measured on the real leg
+                            # inputs; the transfer-less fee-query step must
+                            # not price this tx a second time on mocked ones
+                            # (the retractable-park discipline).
+                            fee_already_measured = True
+                            if all_moved and accepted_in_block and not hard_reject:
+                                pending_payout_execution = (
+                                    pr_entry, pr_decision, pr_balance,
+                                    pr_settlement_id, pr_base,
+                                )
+                                tx_receipt["logs"].append(
+                                    "Payout rule execution staged: "
+                                    + pr_rule_id.hex()
+                                )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3638,6 +3810,79 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "Standing payment executed: " + sp_entry.auth_id.hex()
                         + f" ({settled.amount} over "
                         f"{settled.periods_collected} period(s))"
+                    )
+                if (pending_payout_install is not None
+                        or pending_payout_removal is not None
+                        or pending_payout_execution is not None):
+                    pr_book = _lifecycle_for_write().payout_rules
+                if pending_payout_install is not None:
+                    # Re-checked by install() itself: the fork state the
+                    # branch validated is the state committed here, because
+                    # nothing else in this tx can touch the payout book.
+                    pr_book.install(
+                        pending_payout_install, int(block_timestamp or 0)
+                    )
+                    tx_receipt["payout_event"] = {
+                        "rule_id": pending_payout_install.rule_id.hex(),
+                        "action": "installed",
+                        "owner_pubkey": pending_payout_install.owner_pubkey,
+                        "version": pending_payout_install.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Payout rule installed: "
+                        + pending_payout_install.rule_id.hex()
+                    )
+                elif pending_payout_removal is not None:
+                    removed_rule = pr_book.remove(
+                        pending_payout_removal, int(block_timestamp or 0)
+                    )
+                    tx_receipt["payout_event"] = {
+                        "rule_id": removed_rule.rule_id.hex(),
+                        "action": "removed",
+                        "owner_pubkey": removed_rule.owner_pubkey,
+                        "version": removed_rule.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Payout rule removed: " + removed_rule.rule_id.hex()
+                    )
+                elif pending_payout_execution is not None:
+                    (pr_entry, _pr_decision, pr_balance,
+                     pr_settlement_id, pr_base) = pending_payout_execution
+                    # Same fork, same inputs as the branch's
+                    # evaluate_execution: the settled decision is the staged
+                    # one by construction.
+                    settled = pr_book.execute(
+                        pr_entry.rule_id, pr_settlement_id, pr_base,
+                        int(block_timestamp or 0), pr_balance,
+                    )
+                    tx_receipt["payout_event"] = {
+                        "rule_id": pr_entry.rule_id.hex(),
+                        "action": "executed",
+                        "owner_pubkey": pr_entry.owner_pubkey,
+                        "settlement_id": pr_settlement_id.hex(),
+                        "base_amount": pr_base,
+                        "legs": [
+                            {"recipient_pubkey": r, "amount": a}
+                            for r, a in settled.legs
+                        ],
+                        "total": settled.total,
+                        "period_index": settled.period_index,
+                        "period_total": settled.period_total_after,
+                        "executor_pubkey": sender,
+                    }
+                    # The owner made transfers: stamp THEIR transfer
+                    # history, not the executor's (the standing-execution
+                    # precedent — the generic site below keys off this tx's
+                    # signer and transfers_op_data, neither of which names
+                    # the owner here).
+                    if target_last_transfer_ts is not None:
+                        target_last_transfer_ts[pr_entry.owner_pubkey] = int(
+                            block_timestamp or 0
+                        )
+                    tx_receipt["logs"].append(
+                        "Payout rule executed: " + pr_entry.rule_id.hex()
+                        + f" ({settled.total} over "
+                        f"{len(settled.legs)} leg(s))"
                     )
 
             # Commit staged balance writes only for txs that stay accepted.

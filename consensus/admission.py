@@ -48,6 +48,16 @@ from consensus.approvals import (
     validate_request_shape,
     validate_rule_change_shape,
 )
+from consensus.payout_rules import (
+    TX_TYPE_EXECUTE_PAYOUT_RULE,
+    TX_TYPE_INSTALL_PAYOUT_RULE,
+    TX_TYPE_REMOVE_PAYOUT_RULE,
+    PayoutRuleBook,
+    PayoutRuleShapeError,
+    parse_execute_payout_rule,
+    parse_install_payout_rule,
+    parse_remove_payout_rule,
+)
 from consensus.receive_routes import (
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
     TX_TYPE_REMOVE_RECEIVE_ROUTE,
@@ -1896,6 +1906,161 @@ def validate_execute_standing_payment_payload(
     })
 
 
+# --- Payout rules --------------------------------------------------------------
+
+def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
+    """A book holding exactly one tip payout rule (the facade's row).
+
+    Admission and apply must reach the same verdict, and the verdicts live
+    in the book's can_install/can_remove/evaluate_execution; rebuilding the
+    one-entry book from the tip view lets admission call them verbatim
+    instead of re-implementing the version, cap and settlement rules a
+    second time. The row carries the rule's settlements and period totals,
+    so the rebuilt book also answers the settlement-idempotency and
+    per-period-cap questions identically.
+    """
+    if row is None:
+        return PayoutRuleBook()
+    entry_row = (
+        bytes.fromhex(row["rule_id"]),
+        row["owner_pubkey"],
+        tuple(row["recipients"]),
+        tuple(
+            (leg["recipient_pubkey"], int(leg["mode"]), int(leg["value"]))
+            for leg in row["legs"]
+        ),
+        int(row["max_per_execution"]),
+        int(row["max_per_period"]),
+        int(row["period_seconds"]),
+        int(row["period_anchor_ts"]),
+        int(row["version"]),
+        tuple(
+            (int(t["period_index"]), int(t["total"]))
+            for t in row.get("period_totals", [])
+        ),
+    )
+    settlement_rows = [
+        (
+            bytes.fromhex(row["rule_id"]),
+            bytes.fromhex(s["settlement_id"]),
+            int(s["base_amount"]),
+            int(s["total"]),
+            int(s["execution_ts"]),
+        )
+        for s in row.get("settlements", [])
+    ]
+    return PayoutRuleBook.restore([entry_row], settlement_rows)
+
+
+def validate_install_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for installing (or replacing) a payout rule (#63).
+
+    Shape and state checks are the book's own (`can_install` against the
+    tip's one-entry book), shared with block apply verbatim. A replacement
+    is an install carrying the next version; the book decides.
+    """
+    try:
+        entry = parse_install_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed install_payout_rule: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != entry.owner_pubkey:
+        return format_error(
+            "install_payout_rule sender_pubkey must match the signer.")
+
+    for recipient in entry.recipients:
+        err = validate_bls_pubkey(recipient, "payout_recipients")
+        if err:
+            return format_error(f"install_payout_rule rejected: {err}")
+
+    row = tip_view.get_payout_rule_for_owner(entry.owner_pubkey)
+    ok, reason = _tip_payout_book(row).can_install(
+        entry, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"install_payout_rule rejected: {reason}")
+
+    return success({"rule_id": entry.rule_id.hex()})
+
+
+def validate_remove_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for removing a payout rule (#63).
+
+    Only the owner removes their own rule — removal follows the account's
+    normal rules. The state check is the book's can_remove against the
+    tip's one-entry book, shared with apply.
+    """
+    try:
+        owner = parse_remove_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed remove_payout_rule: {exc}.")
+
+    sender = tx.get("sender_pubkey")
+    if not isinstance(sender, str) or sender != owner:
+        return format_error(
+            "remove_payout_rule sender_pubkey must match the signer.")
+
+    row = tip_view.get_payout_rule_for_owner(owner)
+    if row is None:
+        return format_error(
+            "No payout rule installed for this account.",
+            code="UNKNOWN_PAYOUT_RULE",
+        )
+    ok, reason = _tip_payout_book(row).can_remove(
+        owner, tip_view.next_block_timestamp)
+    if not ok:
+        return format_error(f"remove_payout_rule rejected: {reason}")
+
+    return success({"rule_id": row["rule_id"]})
+
+
+def validate_execute_payout_rule_payload(
+    tx: Dict, tip_view: TipAdmissionView
+) -> AdmissionResult:
+    """Tau-free screens for executing a payout rule (#63).
+
+    Anyone may submit an execution with the rule's inputs. What the rule
+    computes and whether it may settle is the book's evaluate_execution
+    against the tip state and the owner's tip balance — the same call
+    block apply makes, so the two agree on identical state. The owner's
+    o5 re-check per leg and the fee are apply-side (they need the engine's
+    evaluation), exactly as for an ordinary transfer.
+    """
+    try:
+        rule_id, settlement_id, base_amount = parse_execute_payout_rule(tx)
+    except PayoutRuleShapeError as exc:
+        return format_error(f"Malformed execute_payout_rule: {exc}.")
+
+    row = tip_view.get_payout_rule(rule_id)
+    if row is None:
+        return format_error(
+            "Unknown payout rule.",
+            code="UNKNOWN_PAYOUT_RULE",
+        )
+    decision = _tip_payout_book(row).evaluate_execution(
+        rule_id, settlement_id, base_amount,
+        tip_view.next_block_timestamp,
+        tip_view.get_balance(row["owner_pubkey"]),
+    )
+    if not decision.executed:
+        return format_error(
+            f"execute_payout_rule rejected: {decision.reason}")
+
+    return success({
+        "rule_id": rule_id.hex(),
+        "settlement_id": settlement_id.hex(),
+        "total": decision.total,
+        "period_index": decision.period_index,
+        "legs": [
+            {"recipient_pubkey": r, "amount": a} for r, a in decision.legs
+        ],
+    })
+
+
 # Two types carried a height deadline before this was general, each with its own
 # window, and those windows are what their senders and tests already use. The
 # generic ceiling applies to everything else.
@@ -2021,6 +2186,15 @@ def validate_mempool_admission(
 
     elif tx_type == TX_TYPE_EXECUTE_STANDING_PAYMENT:
          return validate_execute_standing_payment_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_INSTALL_PAYOUT_RULE:
+         return validate_install_payout_rule_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
+         return validate_remove_payout_rule_payload(payload, tip_view)
+
+    elif tx_type == TX_TYPE_EXECUTE_PAYOUT_RULE:
+         return validate_execute_payout_rule_payload(payload, tip_view)
 
     else:
          return format_error(f"Unknown or unsupported tx_type exclusively restricted natively: {tx_type}")

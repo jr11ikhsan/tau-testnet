@@ -1001,3 +1001,140 @@ def compute_standing_payment_book_root(records: list, facts: list) -> bytes:
     for blob in encoded_facts:
         out.extend(blob)
     return blake3(bytes(out)).digest()
+
+
+# --- Payout rules (Bounty 01, issue #63) -------------------------------------
+
+DOMAIN_PAYOUT_RULE_V1 = b"tau.payout_rule.v1"
+DOMAIN_PAYOUT_RULE_BOOK_V1 = b"tau.payout_rule.book.v1"
+
+
+def _encode_pubkey_list(pubkeys) -> bytes:
+    out = bytearray()
+    out.extend(encode_uint32(len(pubkeys or ())))
+    for pubkey in (pubkeys or ()):
+        out.extend(encode_pubkey48(pubkey))
+    return bytes(out)
+
+
+def _encode_leg_list(legs) -> bytes:
+    out = bytearray()
+    out.extend(encode_uint32(len(legs or ())))
+    for recipient, mode, value in (legs or ()):
+        out.extend(encode_pubkey48(recipient))
+        out.extend(encode_uint64(int(mode)))
+        out.extend(encode_uint64(int(value)))
+    return bytes(out)
+
+
+def compute_payout_rule_id(
+    owner_pubkey: Any,
+    recipients: Any,
+    legs: Any,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of the canonical payout rule. Returns 32 bytes.
+
+    Content-derived from the signed fields alone, like the receive-route
+    and standing-payment ids: the declared recipient set, the leg program,
+    both caps and the period shape are all inside the hash, so a tampered
+    copy of a rule is a different, unknown rule — never the same one with
+    different terms. `version` keeps a replacement from colliding with the
+    rule it supersedes. The recipient set is encoded sorted (it is a set);
+    the leg program is encoded in its declared order (it is a program).
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_V1.decode()))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(_encode_leg_list(legs))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_payout_rule_record(
+    rule_id: Any,
+    owner_pubkey: Any,
+    recipients: Any,
+    legs: Any,
+    max_per_execution: int,
+    max_per_period: int,
+    period_seconds: int,
+    period_anchor_ts: int,
+    version: int,
+    period_totals: Any,
+) -> bytes:
+    """One payout rule for the book root: signed fields + live period totals.
+
+    The per-period paid totals are consensus state exactly like the terms:
+    two nodes that disagree about how much a rule already paid this period
+    disagree about whether the next execution is within its cap.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(rule_id))
+    out.extend(encode_pubkey48(owner_pubkey))
+    out.extend(_encode_pubkey_list(sorted(recipients or ())))
+    out.extend(_encode_leg_list(legs))
+    out.extend(encode_uint64(int(max_per_execution)))
+    out.extend(encode_uint64(int(max_per_period)))
+    out.extend(encode_uint64(int(period_seconds)))
+    out.extend(encode_uint64(int(period_anchor_ts)))
+    out.extend(encode_uint64(int(version)))
+    totals = sorted((int(i), int(t)) for i, t in (period_totals or ()))
+    out.extend(encode_uint32(len(totals)))
+    for index, total in totals:
+        out.extend(encode_uint64(index))
+        out.extend(encode_uint64(total))
+    return bytes(out)
+
+
+def encode_payout_settlement(
+    rule_id: Any,
+    settlement_id: Any,
+    base_amount: int,
+    total: int,
+    execution_ts: int,
+) -> bytes:
+    """One settled execution for the book root.
+
+    Settlements are rooted separately from the rule records, like the
+    standing book's paid-period facts: they outlive the rule version that
+    produced them, so removing and reinstalling the same rule can never
+    reset a settlement and pay the same execution twice.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(rule_id))
+    out.extend(encode_hash32(settlement_id))
+    out.extend(encode_uint64(int(base_amount)))
+    out.extend(encode_uint64(int(total)))
+    out.extend(encode_uint64(int(execution_ts)))
+    return bytes(out)
+
+
+def compute_payout_rule_book_root(records: list, settlements: list) -> bytes:
+    """BLAKE3 of the payout-rule book: rule records + settlement records.
+
+    `records` are tuples in encode_payout_rule_record argument order and
+    `settlements` in encode_payout_settlement argument order.
+    """
+    encoded_records = sorted(encode_payout_rule_record(*r) for r in (records or []))
+    encoded_settlements = sorted(
+        encode_payout_settlement(*s) for s in (settlements or [])
+    )
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_PAYOUT_RULE_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded_records)))
+    for blob in encoded_records:
+        out.extend(blob)
+    out.extend(encode_uint32(len(encoded_settlements)))
+    for blob in encoded_settlements:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()

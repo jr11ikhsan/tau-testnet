@@ -6,6 +6,7 @@ from typing import Optional, Set
 import config
 import db
 import chain_state
+from consensus.payout_rules import PayoutRuleBook
 from consensus.standing_payments import StandingPaymentBook
 
 logger = logging.getLogger(__name__)
@@ -581,6 +582,89 @@ class TipAdmissionView:
                 if entry is not None:
                     return self._standing_payment_view(book, entry)
         return None
+
+    def _tip_payout_book(self) -> Optional[PayoutRuleBook]:
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        book = getattr(lm, "payout_rules", None)
+        return book if isinstance(book, PayoutRuleBook) else None
+
+    def _payout_rule_view(self, book: PayoutRuleBook, entry) -> dict:
+        """The full view of one payout rule (#63).
+
+        Terms and progress come from the book's own rows — the exact tuples
+        `PayoutRuleBook.restore` consumes, so admission can rebuild the
+        book from this dict and call its can_* verbs verbatim — and the
+        computed fields (current period, its paid total, the settlement
+        records) are the book's own answers at the next block's timestamp.
+        One source for the getpayoutrule command, admission and tests.
+        """
+        from consensus.payout_rules import period_index_at
+
+        row = next(r for r in book.rows() if r[0] == entry.rule_id)
+        (rule_id, owner, recipients, legs, max_exec, max_period,
+         period_seconds, anchor, version, period_totals) = row
+        ts = self.next_block_timestamp
+        period = period_index_at(entry, ts)
+        return {
+            "rule_id": entry.rule_id.hex(),
+            "owner_pubkey": owner,
+            "recipients": list(recipients),
+            "legs": [
+                {"recipient_pubkey": r, "mode": m, "value": v}
+                for r, m, v in legs
+            ],
+            "max_per_execution": max_exec,
+            "max_per_period": max_period,
+            "period_seconds": period_seconds,
+            "period_anchor_ts": anchor,
+            "version": version,
+            "period_totals": [
+                {"period_index": i, "total": t} for i, t in period_totals
+            ],
+            "current_period_index": period,
+            "current_period_total": (
+                book.period_total(entry.rule_id, period) if period >= 0 else 0
+            ),
+            "settlements": [
+                {
+                    "settlement_id": s.settlement_id.hex(),
+                    "base_amount": s.base_amount,
+                    "total": s.total,
+                    "execution_ts": s.execution_ts,
+                }
+                for s in book.settlements_for(entry.rule_id)
+            ],
+        }
+
+    def get_payout_rule(self, rule_id: bytes) -> Optional[dict]:
+        """One payout rule (#63) by id, or None.
+
+        Read from the canonical tip's lifecycle manager — the same
+        in-memory source get_receive_route uses (the payout book's db
+        persistence is the same follow-up as the other books').
+        """
+        book = self._tip_payout_book()
+        if book is None:
+            return None
+        entry = book.get_by_id(bytes(rule_id))
+        if entry is None:
+            return None
+        return self._payout_rule_view(book, entry)
+
+    def get_payout_rule_for_owner(self, owner_pubkey: str) -> Optional[dict]:
+        """The payout rule one owner currently has installed, or None.
+
+        Install admission needs the owner's current entry so it can call
+        the book's can_install verbatim — the next-version rule lives in
+        the book, not here.
+        """
+        book = self._tip_payout_book()
+        if book is None:
+            return None
+        entry = book.get(owner_pubkey)
+        if entry is None:
+            return None
+        return self._payout_rule_view(book, entry)
 
     def get_balance(self, pubkey: str) -> int:
         """The spendable balance at the canonical tip (chain_state's read)."""

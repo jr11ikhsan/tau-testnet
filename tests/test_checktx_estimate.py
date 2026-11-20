@@ -165,6 +165,16 @@ def _payload(kind, fee_limit="0"):
     if kind == "execute_standing_payment":
         return _envelope(kind, SENDER, fee_limit,
                          standing_auth_id=_seed_standing_payment())
+    if kind == "install_payout_rule":
+        return _envelope(kind, SENDER, fee_limit, **_payout_install_fields())
+    if kind == "remove_payout_rule":
+        _seed_installed_payout_rule()
+        return _envelope(kind, SENDER, fee_limit)
+    if kind == "execute_payout_rule":
+        return _envelope(kind, SENDER, fee_limit,
+                         payout_rule_id=_seed_installed_payout_rule(),
+                         payout_settlement_id="11" * 32,
+                         payout_base_amount=101)
     raise AssertionError(kind)
 
 
@@ -178,7 +188,9 @@ FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
                "rule_change_request", "install_receive_route",
                "remove_receive_route", "create_standing_payment",
-               "cancel_standing_payment", "execute_standing_payment"]
+               "cancel_standing_payment", "execute_standing_payment",
+               "install_payout_rule", "remove_payout_rule",
+               "execute_payout_rule"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
@@ -318,6 +330,45 @@ def _seed_standing_payment():
     if book.get(entry.auth_id) is None:
         book.create(entry, TIP_TS)
     return entry.auth_id.hex()
+
+
+def _payout_install_fields():
+    """Root fields for an install the tip book admits, whichever case ran
+    first: version 1 on an empty book, the next version (with a changed
+    cap) once the seed rule is installed. The estimate mutates nothing, so
+    the book state a case sees is exactly what the seed helpers left."""
+    book = chain_state._lifecycle_manager.payout_rules
+    current = book.get(SENDER)
+    fields = {"payout_recipients": [RECIPIENT],
+              "payout_legs": [[RECIPIENT, 2, 500]],
+              "payout_period_seconds": 604800,
+              "payout_period_anchor_ts": TIP_TS,
+              "payout_version": 1}
+    if current is not None:
+        fields["payout_max_per_execution"] = 1000
+        fields["payout_version"] = current.version + 1
+    return fields
+
+
+def _seed_installed_payout_rule():
+    """Install the sender's payout rule in the tip's book, as a mined
+    install would leave it, and return its rule id hex.
+
+    A 5%-of-base royalty to RECIPIENT, anchored at TIP_TS, so an execution
+    on a base of 101 computes a 5-unit leg at any later run time. The
+    estimate mutates nothing, so the one rule serves both the remove and
+    the execute case.
+    """
+    from consensus.payout_rules import PayoutLeg, PayoutRuleEntry
+    book = chain_state._lifecycle_manager.payout_rules
+    entry = PayoutRuleEntry(
+        owner_pubkey=SENDER, recipients=(RECIPIENT,),
+        legs=(PayoutLeg(RECIPIENT, 2, 500),),
+        max_per_execution=0, max_per_period=0,
+        period_seconds=604800, period_anchor_ts=TIP_TS, version=1)
+    if book.get(SENDER) is None:
+        book.install(entry, TIP_TS)
+    return entry.rule_id.hex()
 
 
 def _seed_open_park():
