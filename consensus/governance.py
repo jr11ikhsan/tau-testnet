@@ -8,6 +8,7 @@ from consensus.serialization import compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.receive_routes import ReceiveRouteBook
 from consensus.retractable import RetractableBook
+from consensus.standing_payments import StandingPaymentBook
 
 logger = logging.getLogger(__name__)
 from consensus.approvals import (
@@ -199,6 +200,7 @@ def build_mechanism_metadata(
     approval_slots_active: bool = False,
     retractable_transfers_root: Optional[str] = None,
     receive_routes_root: str = "",
+    standing_payments_root: str = "",
     faucet_amount: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
@@ -251,6 +253,12 @@ def build_mechanism_metadata(
     # (which calls this without it) is unaffected.
     if receive_routes_root:
         mech["receive_routes_root"] = receive_routes_root
+    # Standing payments (#34): same non-default gate. The key is emitted
+    # only once an authorization or a paid-period fact exists, so a chain
+    # that never creates one hashes exactly as it did before the field
+    # existed, and gen_genesis (which calls this without it) is unaffected.
+    if standing_payments_root:
+        mech["standing_payments_root"] = standing_payments_root
     return mech
 
 
@@ -463,6 +471,11 @@ class ConsensusLifecycleManager:
         # the transfer seam reads it on the manager every node already shares,
         # and consensus_meta_hash binds its root once a route exists.
         self.receive_routes = ReceiveRouteBook()
+        # Standing payments (#34). A FIELD for the same reason: the engine
+        # wires create/cancel/execute against the manager every node already
+        # shares, and consensus_meta_hash binds its root once an
+        # authorization or a paid-period fact exists.
+        self.standing_payments = StandingPaymentBook()
         # ONE-WAY activation, held in consensus state rather than as a module
         # global: block apply deep-copies this manager per candidate block
         # (engine.py:511), so a global would leak across candidate simulation,
@@ -560,6 +573,10 @@ class ConsensusLifecycleManager:
             receive_routes_root=(
                 "" if self.receive_routes.is_empty()
                 else self.receive_routes.root().hex()
+            ),
+            standing_payments_root=(
+                "" if self.standing_payments.is_empty()
+                else self.standing_payments.root().hex()
             ),
             faucet_amount=self.faucet_amount,
         )

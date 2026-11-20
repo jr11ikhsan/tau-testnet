@@ -98,6 +98,7 @@ STATUS_CANCELLED = "cancelled"
 STATUS_ENDED = "ended"
 
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
+_AUTH_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
 
 
@@ -259,6 +260,15 @@ def _u64_field(tx: Dict[str, Any], name: str, default: int = 0) -> int:
     return value
 
 
+def _auth_id_field(tx: Dict[str, Any]) -> bytes:
+    value = tx.get("standing_auth_id")
+    if not isinstance(value, str) or not _AUTH_ID_RE.match(value):
+        raise StandingPaymentShapeError(
+            "standing_auth_id must be 64 lowercase hex characters"
+        )
+    return bytes.fromhex(value)
+
+
 def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
     """Read a creation from ROOT fields only; a nested `payload` is unsigned data."""
     if not isinstance(tx, dict):
@@ -287,6 +297,20 @@ def parse_create_standing_payment(tx: Dict[str, Any]) -> StandingPaymentEntry:
         allow_catch_up=bool(catch_up),
         version=_u64_field(tx, "standing_version", default=1),
     )
+
+
+def parse_cancel_standing_payment(tx: Dict[str, Any]) -> bytes:
+    """Read a cancellation's authorization id from ROOT fields only."""
+    if not isinstance(tx, dict):
+        raise StandingPaymentShapeError("transaction must be an object")
+    return _auth_id_field(tx)
+
+
+def parse_execute_standing_payment(tx: Dict[str, Any]) -> bytes:
+    """Read an execution's authorization id from ROOT fields only."""
+    if not isinstance(tx, dict):
+        raise StandingPaymentShapeError("transaction must be an object")
+    return _auth_id_field(tx)
 
 
 def validate_standing_payment_shape(
@@ -472,6 +496,15 @@ class StandingPaymentBook:
 
     def authorization_count(self) -> int:
         return len(self._entries)
+
+    def is_empty(self) -> bool:
+        """True while no authorization and no paid-period fact exists.
+
+        Facts are rooted with the entries and outlive their authorization
+        versions, so a book that has ever settled is never empty again —
+        that is what the meta-hash gate in governance keys off.
+        """
+        return not self._entries and not self._facts
 
     def _entry_and_progress(
         self, auth_id: bytes
@@ -744,3 +777,35 @@ class StandingPaymentBook:
         progress.last_execution_ts = ts
         self._root = None
         return decision
+
+
+# --- Capability reporting -------------------------------------------------------
+
+
+def standing_payment_capabilities() -> Dict[str, Any]:
+    """The standing-payment semantics a capability endpoint reports (#34 case 9).
+
+    Built from the module's own values so the report can never drift from
+    the code: if a bound changes, this record changes with it. (Support and
+    schedule semantics, stated before send — the consensus-level record an
+    endpoint serves, there being no capability-endpoint infrastructure in
+    the codebase yet.)
+    """
+    return {
+        "supported": True,
+        "schedules": sorted(SCHEDULE_NAME_TO_KIND),
+        "max_window_seconds": {
+            name: MAX_WINDOW_SECONDS[kind]
+            for name, kind in sorted(SCHEDULE_NAME_TO_KIND.items())
+        },
+        "end_condition": (
+            "required: a final period, an occurrence limit, or a maximum total"
+        ),
+        "execution": "any party may trigger; the signed terms cannot be altered",
+        "catch_up": "only when the signed terms permit it",
+        "fee": (
+            "the submitter pays the ordinary fee; payer funding only under "
+            "the authorization's signed fee_limit"
+        ),
+        "paid_for_period_fact": True,
+    }

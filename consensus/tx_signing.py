@@ -37,6 +37,11 @@ from consensus.receive_routes import (
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
     TX_TYPE_REMOVE_RECEIVE_ROUTE,
 )
+from consensus.standing_payments import (
+    TX_TYPE_CANCEL_STANDING_PAYMENT,
+    TX_TYPE_CREATE_STANDING_PAYMENT,
+    TX_TYPE_EXECUTE_STANDING_PAYMENT,
+)
 from consensus.retractable import (
     TX_TYPE_RETRACT_TRANSFER,
     TX_TYPE_RETRACTABLE_TRANSFER,
@@ -145,6 +150,34 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # transaction existed, so there is no circularity.
         signing_dict["route_destination_signature"] = payload.get(
             "route_destination_signature")
+    elif tx_type == TX_TYPE_CREATE_STANDING_PAYMENT:
+        # Every field that fixes the authorization is signed: the apply path
+        # installs exactly these root fields (the recipient comes from
+        # sender_pubkey itself), so anything omitted here could be rewritten
+        # by a proposer into a different authorization than the payer chose —
+        # above all the recipient, the amount and the end condition.
+        signing_dict["standing_recipient_pubkey"] = payload.get("standing_recipient_pubkey")
+        signing_dict["standing_amount"] = payload.get("standing_amount")
+        signing_dict["standing_schedule"] = payload.get("standing_schedule")
+        signing_dict["standing_signed_day"] = payload.get("standing_signed_day")
+        signing_dict["standing_anchor_ts"] = payload.get("standing_anchor_ts")
+        signing_dict["standing_window_seconds"] = payload.get("standing_window_seconds")
+        signing_dict["standing_final_ts"] = payload.get("standing_final_ts")
+        signing_dict["standing_max_occurrences"] = payload.get("standing_max_occurrences")
+        signing_dict["standing_max_total"] = payload.get("standing_max_total")
+        signing_dict["standing_fee_limit"] = payload.get("standing_fee_limit")
+        signing_dict["standing_policy_version_ref"] = payload.get("standing_policy_version_ref")
+        signing_dict["standing_allow_catch_up"] = payload.get("standing_allow_catch_up")
+        signing_dict["standing_version"] = payload.get("standing_version")
+    elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
+        # The id names the exact authorization (a hash of its signed terms),
+        # so signing it binds the cancellation to that authorization alone.
+        signing_dict["standing_auth_id"] = payload.get("standing_auth_id")
+    elif tx_type == TX_TYPE_EXECUTE_STANDING_PAYMENT:
+        # Same binding: an execution signature covers exactly one
+        # authorization; the terms executed are the book's, never the
+        # submitter's, so there is nothing else to sign.
+        signing_dict["standing_auth_id"] = payload.get("standing_auth_id")
 
     return json.dumps(signing_dict, sort_keys=True, separators=(",", ":")).encode()
 

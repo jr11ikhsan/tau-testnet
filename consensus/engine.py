@@ -35,6 +35,7 @@ from .approvals import (
 )
 from .receive_routes import (
     CREDIT_ORDINARY_TRANSFER,
+    CREDIT_STANDING_EXECUTION,
     RECEIVE_ROUTE_TX_TYPES,
     TX_TYPE_INSTALL_RECEIVE_ROUTE,
     ReceiveRouteBook,
@@ -42,6 +43,17 @@ from .receive_routes import (
     destination_authorized as route_destination_authorized,
     parse_install_receive_route,
     parse_remove_receive_route,
+)
+from .standing_payments import (
+    STANDING_PAYMENT_TX_TYPES,
+    TX_TYPE_CANCEL_STANDING_PAYMENT,
+    TX_TYPE_CREATE_STANDING_PAYMENT,
+    TX_TYPE_EXECUTE_STANDING_PAYMENT,
+    StandingPaymentBook,
+    StandingPaymentShapeError,
+    parse_cancel_standing_payment,
+    parse_create_standing_payment,
+    parse_execute_standing_payment,
 )
 from .retractable import (
     RETRACTABLE_TX_TYPES,
@@ -83,6 +95,7 @@ FEE_BEARING_TX_TYPES = frozenset(
      TX_TYPE_RULE_CHANGE_REQUEST}
     | set(RULE_OFFER_TX_TYPES)
     | set(RECEIVE_ROUTE_TX_TYPES)
+    | set(STANDING_PAYMENT_TX_TYPES)
 )
 
 
@@ -246,6 +259,17 @@ def _receive_route_book(lm) -> Optional[ReceiveRouteBook]:
     """
     book = getattr(lm, "receive_routes", None)
     return book if isinstance(book, ReceiveRouteBook) else None
+
+
+def _standing_payment_book(lm) -> Optional[StandingPaymentBook]:
+    """The standing-payment book, or None when the manager does not carry one.
+
+    The same isinstance guard as `_receive_route_book`, for the same
+    reason: a stand-in manager must mean "no standing payments" (the
+    legacy behavior), never a phantom authorization.
+    """
+    book = getattr(lm, "standing_payments", None)
+    return book if isinstance(book, StandingPaymentBook) else None
 
 
 def _escrow_total(lm) -> int:
@@ -997,6 +1021,17 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if entries and id(tx) in accepted_obj:
                 routing_events.extend(entries)
 
+        # Standing-payment events (#34): creates, cancels and executions
+        # that stayed accepted, in transaction order — carried on the
+        # snapshot exactly as the routing events are, for history to record.
+        standing_payment_events = []
+        for i, tx in enumerate(block.transactions):
+            event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
+                "standing_payment_event"
+            )
+            if event and id(tx) in accepted_obj:
+                standing_payment_events.append(event)
+
         # 3. Post-State Materialization Layer
         
         # The rules are updated by self.apply (it returns a generic snapshot with tau_bytes).
@@ -1153,6 +1188,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "active_consensus_id": next_active_consensus_id,
                 "retractable_events": retractable_events,
                 "routing_events": routing_events,
+                "standing_payment_events": standing_payment_events,
             }
         )
         
@@ -1167,6 +1203,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "released_retractables": released_retractables,
                 "retractable_events": retractable_events,
                 "routing_events": routing_events,
+                "standing_payment_events": standing_payment_events,
             },
             mempool_hints={"safe_to_drop": accepted_ids + skipped_ids}
         )
@@ -1706,6 +1743,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # accepted (its fee paid), so a rejected install leaves no route.
             pending_route_install = None
             pending_route_removal = None
+            # Standing-payment mutations defer to the same post-settlement
+            # site, for the same reason: a create whose fee is never paid
+            # installs no authorization, a fee-rejected cancel cancels
+            # nothing, and an execution advances its markers only once the
+            # transfer it staged is known to stay in the block.
+            pending_standing_create = None
+            pending_standing_cancel = None
+            pending_standing_execution = None
 
             def _read_bal(addr: str) -> int:
                 """Balance as seen through this tx's staged writes."""
@@ -2780,6 +2825,151 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 "Receive route removal staged: " + route_owner[:10] + "..."
                             )
 
+            elif tx_type in STANDING_PAYMENT_TX_TYPES:
+                # Nothing here reads nested `payload`: only root fields are
+                # signed, so anything else is unsigned data. Validation runs
+                # against this transaction's lifecycle fork through the
+                # book's own can_create/can_cancel/execution_due (the same
+                # functions admission calls), and every mutation is deferred
+                # to the post-settlement site below, so a tx whose fee is
+                # never paid creates, cancels and settles nothing.
+                operations = {}
+                if accepted_in_block and not hard_reject:
+                    sp_book = _lifecycle_for_write().standing_payments
+                    sp_ts = int(block_timestamp or 0)
+                    if tx_type == TX_TYPE_CREATE_STANDING_PAYMENT:
+                        try:
+                            sp_entry = parse_create_standing_payment(tx)
+                        except StandingPaymentShapeError as exc:
+                            sp_entry = None
+                            reason = f"invalid standing payment ({exc})"
+                        else:
+                            if not isinstance(sender, str) or sender != sp_entry.payer_pubkey:
+                                reason = "sender is not the payer"
+                            else:
+                                _, reason = sp_book.can_create(sp_entry, sp_ts)
+                        if sp_entry is None or reason:
+                            tx_receipt["logs"].append(f"Standing payment create ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_created"
+                            accepted_in_block = False
+                        else:
+                            pending_standing_create = sp_entry
+                            tx_receipt["logs"].append(
+                                "Standing payment create staged: " + sp_entry.auth_id.hex()
+                            )
+                    elif tx_type == TX_TYPE_CANCEL_STANDING_PAYMENT:
+                        try:
+                            sp_auth_id = parse_cancel_standing_payment(tx)
+                        except StandingPaymentShapeError as exc:
+                            sp_auth_id = None
+                            reason = f"invalid standing payment cancellation ({exc})"
+                        else:
+                            sp_entry = sp_book.get(sp_auth_id)
+                            if sp_entry is None:
+                                reason = "no standing payment with this id"
+                            elif not isinstance(sender, str) or sender != sp_entry.payer_pubkey:
+                                reason = "sender is not the payer"
+                            else:
+                                _, reason = sp_book.can_cancel(sp_auth_id, sp_ts)
+                        if sp_auth_id is None or reason:
+                            tx_receipt["logs"].append(f"Standing payment cancel ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_cancelled"
+                            accepted_in_block = False
+                        else:
+                            pending_standing_cancel = sp_auth_id
+                            tx_receipt["logs"].append(
+                                "Standing payment cancel staged: " + sp_auth_id.hex()
+                            )
+                    else:  # TX_TYPE_EXECUTE_STANDING_PAYMENT
+                        try:
+                            sp_auth_id = parse_execute_standing_payment(tx)
+                        except StandingPaymentShapeError as exc:
+                            sp_auth_id = None
+                            sp_entry = None
+                            sp_decision = None
+                            sp_balance = 0
+                            reason = f"invalid standing payment execution ({exc})"
+                        else:
+                            sp_entry = sp_book.get(sp_auth_id)
+                            if sp_entry is None:
+                                sp_decision = None
+                                sp_balance = 0
+                                reason = "no standing payment with this id"
+                            else:
+                                # The book decides what is due against the
+                                # payer's balance as this tx sees it; the
+                                # transfer below then moves exactly that
+                                # amount through the ordinary seam, so the
+                                # payer's o5 is re-checked on the real
+                                # recipient and amount by the same
+                                # evaluation an ordinary transfer of theirs
+                                # would face.
+                                sp_balance = _read_bal(sp_entry.payer_pubkey)
+                                sp_decision = sp_book.execution_due(
+                                    sp_auth_id, sp_ts, sp_balance,
+                                    executor_pubkey=(
+                                        sender if isinstance(sender, str) else None
+                                    ),
+                                )
+                                reason = "" if sp_decision.executed else sp_decision.reason
+                        if sp_auth_id is None or reason:
+                            tx_receipt["logs"].append(f"Standing payment execution ignored: {reason}")
+                            tx_receipt["reason"] = "standing_payment_not_executed"
+                            accepted_in_block = False
+                        else:
+                            # Settle through the normal transfer path: the
+                            # policy gates, the balance check and the fee
+                            # measurement are the seam's own. The credit
+                            # carries the standing-execution class, so a
+                            # receive route never splits it (the design's
+                            # credit-class table) — the seam stages it
+                            # whole. No custom inputs: the executor's
+                            # inputs must not steer the payer's policy
+                            # evaluation; the signed terms are the entry's.
+                            moved = _execute_fee_era_transfer(
+                                sp_entry.payer_pubkey, sp_entry.recipient_pubkey,
+                                sp_decision.amount,
+                                slot_values=_approval_slot_values(),
+                                overrides={},
+                                credit_class=CREDIT_STANDING_EXECUTION,
+                            )
+                            # The fee was measured on the real transfer
+                            # inputs; the transfer-less fee-query step must
+                            # not price this tx a second time on mocked ones
+                            # (the retractable-park discipline).
+                            fee_already_measured = True
+                            if moved and accepted_in_block and not hard_reject:
+                                if (isinstance(sender, str)
+                                        and sender == sp_entry.payer_pubkey
+                                        and sp_entry.fee_limit
+                                        and sum(fee_components) > sp_entry.fee_limit):
+                                    # Payer-funded fees are bounded by the
+                                    # signed fee_limit: when the payer is
+                                    # the submitter the measured fee IS
+                                    # payer-funded, so an execution whose
+                                    # fee exceeds the authorization's own
+                                    # cap does not settle. Undo the staged
+                                    # transfer (the vote path's discipline);
+                                    # the book was never touched.
+                                    staged_writes.clear()
+                                    accepted_in_block = False
+                                    hard_reject = True
+                                    execution_success = False
+                                    tx_receipt["reason"] = "standing_fee_limit_exceeded"
+                                    tx_receipt["logs"].append(
+                                        "Standing payment execution refused: fee "
+                                        f"{sum(fee_components)} exceeds the "
+                                        f"authorization's fee_limit {sp_entry.fee_limit}"
+                                    )
+                                else:
+                                    pending_standing_execution = (
+                                        sp_entry, sp_decision, sp_balance
+                                    )
+                                    tx_receipt["logs"].append(
+                                        "Standing payment execution staged: "
+                                        + sp_auth_id.hex()
+                                    )
+
             elif tx_type == 'consensus_rule_vote':
                 vote = parse_consensus_rule_vote(tx)
                 if vote and sender:
@@ -3350,6 +3540,104 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["route_event"] = (removed_route.route_id.hex(), "removed")
                     tx_receipt["logs"].append(
                         "Receive route removed: " + removed_route.route_id.hex()
+                    )
+                if (pending_standing_create is not None
+                        or pending_standing_cancel is not None
+                        or pending_standing_execution is not None):
+                    sp_book = _lifecycle_for_write().standing_payments
+                if pending_standing_create is not None:
+                    # Re-checked by create() itself: the fork state the
+                    # branch validated is the state committed here.
+                    sp_book.create(
+                        pending_standing_create, int(block_timestamp or 0)
+                    )
+                    tx_receipt["standing_payment_event"] = {
+                        "auth_id": pending_standing_create.auth_id.hex(),
+                        "action": "created",
+                        "payer_pubkey": pending_standing_create.payer_pubkey,
+                        "recipient_pubkey": pending_standing_create.recipient_pubkey,
+                        "amount": pending_standing_create.amount,
+                        "version": pending_standing_create.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Standing payment created: "
+                        + pending_standing_create.auth_id.hex()
+                    )
+                elif pending_standing_cancel is not None:
+                    cancelled_entry = sp_book.cancel(
+                        pending_standing_cancel, int(block_timestamp or 0)
+                    )
+                    tx_receipt["standing_payment_event"] = {
+                        "auth_id": pending_standing_cancel.hex(),
+                        "action": "cancelled",
+                        "payer_pubkey": cancelled_entry.payer_pubkey,
+                        "recipient_pubkey": cancelled_entry.recipient_pubkey,
+                        "amount": cancelled_entry.amount,
+                        "version": cancelled_entry.version,
+                    }
+                    tx_receipt["logs"].append(
+                        "Standing payment cancelled: "
+                        + pending_standing_cancel.hex()
+                    )
+                elif pending_standing_execution is not None:
+                    sp_entry, _sp_decision, sp_balance = pending_standing_execution
+                    # Same fork, same inputs as the branch's execution_due:
+                    # the settled decision is the staged one by construction.
+                    settled = sp_book.execute(
+                        sp_entry.auth_id, int(block_timestamp or 0), sp_balance,
+                        executor_pubkey=(
+                            sender if isinstance(sender, str) else None
+                        ),
+                    )
+                    sp_event = {
+                        "auth_id": sp_entry.auth_id.hex(),
+                        "action": "executed",
+                        "payer_pubkey": sp_entry.payer_pubkey,
+                        "recipient_pubkey": sp_entry.recipient_pubkey,
+                        "amount": settled.amount,
+                        "period_index": settled.period_index,
+                        "periods_collected": settled.periods_collected,
+                        "total_paid": settled.total_paid_after,
+                        "executor_pubkey": sender,
+                    }
+                    # Payer-funded fee opt-in: the authorization's signed
+                    # fee_limit bounds what the payer funds for a
+                    # third-party execution. The reimbursement is staged
+                    # here, before the staged-writes commit, only when the
+                    # payer's post-payment balance covers it; the credit is
+                    # staged directly (a node-made credit — it never
+                    # re-enters the transfer seam, so it cannot route).
+                    fee_charged = int(tx_receipt.get("fee_charged") or 0)
+                    if (fee_charged and sp_entry.fee_limit
+                            and isinstance(sender, str)
+                            and sender != sp_entry.payer_pubkey):
+                        reimburse = min(fee_charged, sp_entry.fee_limit)
+                        payer_now = _read_bal(sp_entry.payer_pubkey)
+                        if 0 < reimburse <= payer_now:
+                            staged_writes[sp_entry.payer_pubkey] = (
+                                payer_now - reimburse
+                            )
+                            staged_writes[sender] = _read_bal(sender) + reimburse
+                            sp_event["fee_reimbursed"] = reimburse
+                            tx_receipt["logs"].append(
+                                f"Standing payment fee reimbursed: {reimburse} "
+                                "to the executor under the authorization's "
+                                f"fee_limit {sp_entry.fee_limit}"
+                            )
+                    tx_receipt["standing_payment_event"] = sp_event
+                    # The payer made a transfer: stamp THEIR transfer
+                    # history, not the executor's (the vote-release
+                    # precedent — the generic site below keys off this tx's
+                    # signer and transfers_op_data, neither of which names
+                    # the payer here).
+                    if target_last_transfer_ts is not None:
+                        target_last_transfer_ts[sp_entry.payer_pubkey] = int(
+                            block_timestamp or 0
+                        )
+                    tx_receipt["logs"].append(
+                        "Standing payment executed: " + sp_entry.auth_id.hex()
+                        + f" ({settled.amount} over "
+                        f"{settled.periods_collected} period(s))"
                     )
 
             # Commit staged balance writes only for txs that stay accepted.
