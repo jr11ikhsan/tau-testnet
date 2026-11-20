@@ -65,26 +65,6 @@ class TestStandingPaymentsNativeE2E(unittest.TestCase):
     """Full pipeline with a live Tau interpreter (the fee-native pattern)."""
 
     def setUp(self):
-        if not config.MINER_PRIVKEY:
-            # The CI job's config profile leaves MINER_PRIVKEY unset (the
-            # key loaders return None in that environment — see config.py),
-            # which made this gate skip the suite in exactly the job it
-            # exists for. The job preamble generates the miner identity
-            # into data_local/ before pytest runs, so load it with
-            # config's own loaders and install it where createblock reads
-            # it at call time; skip only when the identity genuinely does
-            # not exist.
-            _priv = config._load_miner_privkey_from_path(
-                os.path.join(config.DATA_LOCAL_DIR, "test_miner.key"))
-            _pub = config._load_miner_pubkey_from_path(
-                os.path.join(config.DATA_LOCAL_DIR, "test_miner.pub"))
-            if not _priv or not _pub:
-                self.skipTest(
-                    "data_local/test_miner.key absent; local miner identity required "
-                    "for real PoA mining (see config.DATA_LOCAL_DIR)"
-                )
-            config.MINER_PRIVKEY = _priv
-            config.MINER_PUBKEY = _pub
         try:
             iface = tau_native.TauInterface(GENESIS_TAU)
         except TauEngineCrash:
@@ -96,6 +76,28 @@ class TestStandingPaymentsNativeE2E(unittest.TestCase):
         self.test_db = os.path.join(self._tmpdir, "test_standing_native_db.sqlite")
         self.original_db = config.STRING_DB_PATH
         config.set_database_path(self.test_db)
+        if not config.MINER_PRIVKEY:
+            # The CI job's config profile leaves MINER_PRIVKEY unset (the
+            # key loaders return None in that environment — see config.py),
+            # which made this gate skip the suite in exactly the job it
+            # exists for. The job preamble generates the miner identity
+            # into data_local/ before pytest runs, so load it with
+            # config's own loaders and install it where createblock reads
+            # it at call time; skip only when the identity genuinely does
+            # not exist.
+            # Placement matters: this runs after set_database_path, whose
+            # legacy-export re-sync from the profile would wipe it otherwise.
+            _priv = config._load_miner_privkey_from_path(
+                os.path.join(config.DATA_LOCAL_DIR, "test_miner.key"))
+            _pub = config._load_miner_pubkey_from_path(
+                os.path.join(config.DATA_LOCAL_DIR, "test_miner.pub"))
+            if not _priv or not _pub:
+                self.skipTest(
+                    "data_local/test_miner.key absent; local miner identity required "
+                    "for real PoA mining (see config.DATA_LOCAL_DIR)"
+                )
+            config.MINER_PRIVKEY = _priv
+            config.MINER_PUBKEY = _pub
         if db._db_conn:
             db._db_conn.close()
         db._db_conn = None
