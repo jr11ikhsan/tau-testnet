@@ -84,14 +84,14 @@ def test_a_rule_answers_after_every_other_rule_built_in_one_worker():
     ev = _fresh_evaluator()
     try:
         fifth = _divide(5)
-        assert ev.outputs(fifth, {"i27": "100"})["o30"] == "20"
+        assert ev.outputs(fifth, {"i27": "100"}).outputs["o30"] == "20"
         refusals = []
         wrong = []
         for by in range(6, 66):
             assert ev.validate(_divide(by)).ok
             for value, want in (("100", "20"), ("101", "20")):
                 try:
-                    got = ev.outputs(fifth, {"i27": value})["o30"]
+                    got = ev.outputs(fifth, {"i27": value}).outputs["o30"]
                 except (PolicyStepError, PolicyBuildError) as exc:
                     refusals.append((by, value, str(exc)[:120]))
                     continue
@@ -133,7 +133,7 @@ def test_rules_in_turn_in_one_pool_all_answer_like_their_model():
             body, model = rng.choice(rules)
             value = rng.choice([0, 1, 4, 9, 10, 25, 50, 51, 100, 101, 999, 65_535, 1_000_000])
             try:
-                got = ev.outputs(body, {"i27": str(value)})["o30"]
+                got = ev.outputs(body, {"i27": str(value)}).outputs["o30"]
             except (PolicyStepError, PolicyBuildError) as exc:
                 refusals.append((n, body[:40], value, str(exc)[:120]))
                 continue
@@ -156,7 +156,7 @@ def test_fresh_workers_step_after_a_second_rule_was_validated():
         try:
             assert ev.validate(_divide(6 + (trial % 60))).ok
             try:
-                got = ev.outputs(_divide(5), {"i27": "100"})["o30"]
+                got = ev.outputs(_divide(5), {"i27": "100"}).outputs["o30"]
             except (PolicyStepError, PolicyBuildError) as exc:
                 refusals.append((trial, str(exc)[:120]))
                 continue
