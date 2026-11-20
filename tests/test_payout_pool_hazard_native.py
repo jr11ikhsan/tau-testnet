@@ -35,6 +35,15 @@ the reproduction: it proves the hazard reaches our payout path. The fix
 (one interpreter at a time, never pinned, for payout-clause stepping only)
 must make these pass without touching the o5 clause pools.
 
+Tests E and F arm the trigger deterministically: pin_build_seconds=0.0 makes
+EVERY build pin its interpreter (elapsed > 0 is always true), so the cache
+holds pinned interpreters built earlier — the exact condition jimb's patch
+removes. Each asserts the worker really pinned entries (stats()["pinned"]
+>= 1), so a pass cannot be explained away by "the trigger was never armed".
+If E or F fails, the hazard is real but timing-dependent in the default
+configuration, and the fix is warranted; if they pass, the negative verdict
+is strong.
+
 Kept in its own file so the real-Tau CI job can register exactly this
 file: the proof needs the native bindings the mock job does not have. The
 skip is environment-driven, exactly as the other Bounty 01 native suites.
@@ -205,3 +214,71 @@ def test_g4_payout_clause_answers_after_other_rules_in_the_apply_pool():
                 wrong.append((k, pool, got))
     assert not refusals, f"G4 clause step refusals via clause_outputs: {refusals[:10]} (total {len(refusals)})"
     assert not wrong, f"G4 clause wrong legs via clause_outputs: {wrong[:10]} (total {len(wrong)})"
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+def test_armed_pinning_still_answers_after_other_rules_built():
+    """E (trigger armed): the same in-turn pattern as A, but on an evaluator
+    with pin_build_seconds=0.0, so EVERY build pins its interpreter and the
+    cache holds pinned interpreters built earlier — the condition jimb's
+    patch removes. The test asserts the worker really pinned entries, so a
+    pass cannot be explained by an unarmed trigger."""
+    ev = tau_policy.PolicyEvaluator(pool="apply", pin_build_seconds=0.0)
+    try:
+        fifth = _divide(5)
+        assert ev.outputs(fifth, {"i27": "100"}).outputs["o30"] == "20"
+        refusals = []
+        wrong = []
+        for by in range(6, 66):
+            assert ev.validate(_divide(by)).ok
+            for value, want in (("100", "20"), ("101", "20")):
+                try:
+                    got = ev.outputs(fifth, {"i27": value}).outputs["o30"]
+                except (PolicyStepError, PolicyBuildError) as exc:
+                    refusals.append((by, value, str(exc)[:120]))
+                    continue
+                if got != want:
+                    wrong.append((by, value, got, want))
+        pinned = ev.stats().get("pinned", 0)
+        assert pinned >= 1, f"trigger not armed: worker pinned {pinned} interpreters"
+        assert not refusals, f"refusals under armed pinning: {refusals}"
+        assert not wrong, f"wrong answers under armed pinning: {wrong}"
+    finally:
+        ev.close()
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+def test_g4_path_under_armed_pinning():
+    """F (trigger armed, G4 path): the real grant clause through
+    sender_policy.clause_outputs(pool="apply") with the apply pool's
+    evaluator replaced by one that pins every build. Same expectations as
+    D; the override is restored afterwards."""
+    from tests.test_payout_tau_rule_native import _grant_clause
+
+    now = int(time.time())
+    anchor = now - 3 * WEEK + 60
+    clause = _grant_clause(anchor, 0, 1)
+    inputs = {"i1": "500", "i2": "5000", "i3": "0", "i4": "0",
+              "i5": str(now), "i26": "1000"}
+    want = {"o30": "1", "o31": "0", "o32": "500"}
+    ev = tau_policy.PolicyEvaluator(pool="apply", pin_build_seconds=0.0)
+    sender_policy.set_evaluator("apply", ev)
+    try:
+        refusals = []
+        wrong = []
+        for k in range(60):
+            assert ev.validate(_divide(6 + k)).ok
+            outputs, detail = sender_policy.clause_outputs(clause, inputs, pool="apply")
+            if outputs is None:
+                refusals.append((k, detail[:120]))
+                continue
+            got = {name: outputs.get(name) for name in ("o30", "o31", "o32")}
+            if got != want:
+                wrong.append((k, got))
+        pinned = ev.stats().get("pinned", 0)
+        assert pinned >= 1, f"trigger not armed: worker pinned {pinned} interpreters"
+        assert not refusals, f"G4 clause refusals under armed pinning: {refusals[:10]} (total {len(refusals)})"
+        assert not wrong, f"G4 clause wrong legs under armed pinning: {wrong[:10]} (total {len(wrong)})"
+    finally:
+        sender_policy.set_evaluator("apply", None)
+        ev.close()
