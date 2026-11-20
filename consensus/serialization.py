@@ -856,3 +856,148 @@ def compute_receive_route_book_root(entries: list) -> bytes:
     for blob in encoded:
         out.extend(blob)
     return blake3(bytes(out)).digest()
+
+
+# --- Standing payments (Bounty 01, issue #34) ---------------------------------
+
+DOMAIN_STANDING_PAYMENT_V1 = b"tau.standing_payment.v1"
+DOMAIN_STANDING_PAYMENT_BOOK_V1 = b"tau.standing_payment.book.v1"
+
+
+def compute_standing_payment_id(
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    schedule_kind: int,
+    signed_day: int,
+    anchor_ts: int,
+    window_seconds: int,
+    final_ts: int,
+    max_occurrences: int,
+    max_total: int,
+    fee_limit: int,
+    policy_version_ref: int,
+    allow_catch_up: int,
+    version: int,
+) -> bytes:
+    """BLAKE3 of the canonical standing-payment authorization. Returns 32 bytes.
+
+    Content-derived from the signed fields alone, like the receive-route id:
+    every term the payer signed is in the hash, so a tampered copy of an
+    authorization is a different, unknown authorization — never the same one
+    with different terms. `version` keeps an update from colliding with the
+    version it supersedes.
+    """
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_PAYMENT_V1.decode()))
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(anchor_ts)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(final_ts)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    out.extend(encode_uint64(int(max_total)))
+    out.extend(encode_uint64(int(fee_limit)))
+    out.extend(encode_uint64(int(policy_version_ref)))
+    out.extend(encode_uint64(int(allow_catch_up)))
+    out.extend(encode_uint64(int(version)))
+    return blake3(bytes(out)).digest()
+
+
+def encode_standing_payment_record(
+    auth_id: Any,
+    payer_pubkey: Any,
+    recipient_pubkey: Any,
+    amount: int,
+    schedule_kind: int,
+    signed_day: int,
+    anchor_ts: int,
+    window_seconds: int,
+    final_ts: int,
+    max_occurrences: int,
+    max_total: int,
+    fee_limit: int,
+    policy_version_ref: int,
+    allow_catch_up: int,
+    version: int,
+    settled_periods: Any,
+    total_paid: int,
+    last_execution_ts: int,
+    cancelled: int,
+    cancelled_ts: int,
+) -> bytes:
+    """One authorization for the book root: signed fields + live progress.
+
+    The progress (settled-period markers, cumulative total, cancellation) is
+    consensus state exactly like the terms: two nodes that disagree about
+    whether a period was paid disagree about the state root.
+    """
+    out = bytearray()
+    out.extend(encode_hash32(auth_id))
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_pubkey48(recipient_pubkey))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(schedule_kind)))
+    out.extend(encode_uint64(int(signed_day)))
+    out.extend(encode_uint64(int(anchor_ts)))
+    out.extend(encode_uint64(int(window_seconds)))
+    out.extend(encode_uint64(int(final_ts)))
+    out.extend(encode_uint64(int(max_occurrences)))
+    out.extend(encode_uint64(int(max_total)))
+    out.extend(encode_uint64(int(fee_limit)))
+    out.extend(encode_uint64(int(policy_version_ref)))
+    out.extend(encode_uint64(int(allow_catch_up)))
+    out.extend(encode_uint64(int(version)))
+    periods = sorted(int(p) for p in (settled_periods or ()))
+    out.extend(encode_uint32(len(periods)))
+    for period in periods:
+        out.extend(encode_uint64(period))
+    out.extend(encode_uint64(int(total_paid)))
+    out.extend(encode_uint64(int(last_execution_ts)))
+    out.extend(encode_uint64(int(cancelled)))
+    out.extend(encode_uint64(int(cancelled_ts)))
+    return bytes(out)
+
+
+def encode_paid_period_fact(
+    auth_id: Any,
+    payer_pubkey: Any,
+    period_index: int,
+    period_start_ts: int,
+    period_end_ts: int,
+    amount: int,
+    execution_ts: int,
+) -> bytes:
+    out = bytearray()
+    out.extend(encode_hash32(auth_id))
+    out.extend(encode_pubkey48(payer_pubkey))
+    out.extend(encode_uint64(int(period_index)))
+    out.extend(encode_uint64(int(period_start_ts)))
+    out.extend(encode_uint64(int(period_end_ts)))
+    out.extend(encode_uint64(int(amount)))
+    out.extend(encode_uint64(int(execution_ts)))
+    return bytes(out)
+
+
+def compute_standing_payment_book_root(records: list, facts: list) -> bytes:
+    """BLAKE3 of the standing-payment book: records + paid-period facts.
+
+    `records` are tuples in encode_standing_payment_record argument order and
+    `facts` in encode_paid_period_fact argument order. Facts outlive their
+    authorization (an update supersedes the entry, never the history), so
+    they are rooted separately instead of nested inside a record.
+    """
+    encoded_records = sorted(encode_standing_payment_record(*r) for r in (records or []))
+    encoded_facts = sorted(encode_paid_period_fact(*f) for f in (facts or []))
+    out = bytearray()
+    out.extend(encode_string(DOMAIN_STANDING_PAYMENT_BOOK_V1.decode()))
+    out.extend(encode_uint32(len(encoded_records)))
+    for blob in encoded_records:
+        out.extend(blob)
+    out.extend(encode_uint32(len(encoded_facts)))
+    for blob in encoded_facts:
+        out.extend(blob)
+    return blake3(bytes(out)).digest()
