@@ -330,9 +330,12 @@ def decode_clause_legs(
     count; leg k reads its recipient candidate index — 0-based into the
     entry's canonical recipients tuple — from o(31+2k) and its amount from
     o(32+2k). Zero-amount legs are dropped, as compute_legs drops them. A
-    count above MAX_LEGS, a missing or unreadable value, or an index
-    outside the declared set means the clause named something the node
-    cannot settle: no legs, and the execution settles nothing.
+    count above MAX_LEGS, a missing or unreadable value, an index
+    outside the declared set, or an index named twice means the clause
+    named something the node cannot settle: no legs, and the execution
+    settles nothing. A repeated index refuses even when one of the legs
+    carries a zero amount — the pairs are the clause's output, and a
+    candidate named twice is malformed output, not two legs.
     """
     count = _parse_output_value(outputs.get(f"o{PAYOUT_OUTPUT_COUNT_STREAM}"))
     if count is None:
@@ -340,6 +343,7 @@ def decode_clause_legs(
     if count < 0 or count > MAX_LEGS:
         return None, f"the rule's clause reported {count} legs"
     legs: List[Tuple[str, int]] = []
+    seen: set = set()
     for k in range(count):
         index = _parse_output_value(
             outputs.get(f"o{PAYOUT_OUTPUT_FIRST_STREAM + 2 * k}")
@@ -354,6 +358,12 @@ def decode_clause_legs(
                 "the rule's clause named recipient candidate "
                 f"{index}, outside the declared set"
             )
+        if index in seen:
+            return None, (
+                "the rule's clause named recipient candidate "
+                f"{index} more than once"
+            )
+        seen.add(index)
         if amount > 0:
             legs.append((entry.recipients[index], amount))
     return tuple(legs), ""

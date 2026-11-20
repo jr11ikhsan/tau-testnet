@@ -345,6 +345,43 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("66" * 32)))
 
+    def test_clause_duplicate_candidate_index_settles_nothing(self):
+        # A candidate named twice is malformed output, not two legs: the
+        # whole execution settles nothing — refused at admission, and
+        # refused again at inclusion with admission bypassed. The total
+        # (150) is under the declared 500 per-execution cap, so only the
+        # duplicate rule can refuse this execution.
+        now = int(time.time())
+        clause = (
+            "((o30[t]:bv[64] = { 2 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64]) "
+            "&& (o33[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o34[t]:bv[64] = { 50 }:bv[64]))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=0,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        blob = self._execute_tx(entry.rule_id, "77" * 32, 1)
+        before = self._balances()
+        res = sendtx.queue_transaction(blob, propagate=False)
+        self.assertFalse(res["ok"], f"duplicate-index execution admitted: {res}")
+        # Inclusion on its own refuses it too, with admission bypassed.
+        forced = self._force_queue(blob)
+        self._mine()
+        self.assertFalse(self._included(forced),
+                         "inclusion settled a duplicate candidate index")
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 0)
+        self.assertEqual(after[OWNER] - before[OWNER], 0)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("77" * 32)))
+
 
 if __name__ == "__main__":
     unittest.main()

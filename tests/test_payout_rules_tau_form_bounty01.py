@@ -227,6 +227,11 @@ def test_decode_clause_legs_refuses_what_the_node_cannot_settle():
         {"o30": "1", "o31": "0"},                               # missing amount
         {"o30": "1", "o31": "x", "o32": "5"},                   # unreadable index
         {"o30": "1", "o31": "2", "o32": "5"},                   # outside the set
+        # A candidate named twice is malformed output, not two legs —
+        # the whole execution settles nothing.
+        {"o30": "2", "o31": "0", "o32": "5", "o33": "0", "o34": "7"},
+        # ... even when one of the two legs carries a zero amount.
+        {"o30": "2", "o31": "1", "o32": "0", "o33": "1", "o34": "9"},
     ):
         legs, why = decode_clause_legs(entry, outputs)
         assert legs is None and why, outputs
