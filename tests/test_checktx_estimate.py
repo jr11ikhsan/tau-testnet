@@ -147,6 +147,24 @@ def _payload(kind, fee_limit="0"):
     if kind == "rule_change_request":
         return _envelope(kind, SENDER, fee_limit, kind=1, rule_text=OFFER_RULE,
                          approvers={"18": APPROVER})
+    if kind == "install_receive_route":
+        return _envelope(kind, SENDER, fee_limit,
+                         route_destination_pubkey=RECIPIENT, route_bps=2000)
+    if kind == "remove_receive_route":
+        _seed_installed_route()
+        return _envelope(kind, SENDER, fee_limit)
+    if kind == "create_standing_payment":
+        return _envelope(kind, SENDER, fee_limit,
+                         standing_recipient_pubkey=APPROVER, standing_amount=100,
+                         standing_schedule="weekly", standing_anchor_ts=TIP_TS,
+                         standing_window_seconds=604800,
+                         standing_max_occurrences=10000)
+    if kind == "cancel_standing_payment":
+        return _envelope(kind, SENDER, fee_limit,
+                         standing_auth_id=_seed_standing_payment())
+    if kind == "execute_standing_payment":
+        return _envelope(kind, SENDER, fee_limit,
+                         standing_auth_id=_seed_standing_payment())
     raise AssertionError(kind)
 
 
@@ -158,7 +176,9 @@ def _check(payload, *, estimate=True):
 
 FEE_BEARING = ["user_tx", "retractable_transfer", "rule_offer",
                "rule_offer_accept", "rule_offer_reject", "approval_request",
-               "rule_change_request"]
+               "rule_change_request", "install_receive_route",
+               "remove_receive_route", "create_standing_payment",
+               "cancel_standing_payment", "execute_standing_payment"]
 
 
 def test_the_cases_cover_every_fee_bearing_type():
@@ -263,6 +283,41 @@ def test_an_estimate_with_no_payload_shows_the_usage(node):
     env = json.loads(checktx.execute("checktx estimate", None))
     assert env["error"]["code"] == "INVALID_PARAMS"
     assert "checktx [estimate]" in env["error"]["message"]
+
+
+def _seed_installed_route():
+    """Install the sender's receive route in the tip's book, as a mined
+    install would leave it, so a removal has something to remove."""
+    from consensus.receive_routes import ReceiveRouteEntry
+    book = chain_state._lifecycle_manager.receive_routes
+    if book.get(SENDER) is None:
+        book.install(ReceiveRouteEntry(
+            owner_pubkey=SENDER, destination_pubkey=RECIPIENT, bps=2000,
+            min_amount=0, activation_ts=0, expiry_ts=0, locked_until_ts=0,
+            version=1), TIP_TS)
+
+
+def _seed_standing_payment():
+    """Create the sender's standing payment in the tip's book, as a mined
+    creation would leave it, and return its authorization id hex.
+
+    Weekly from TIP_TS with a full-period window, so the current period is
+    due at any later tip time and an execution always has a period to settle.
+    The estimate mutates nothing, so the one authorization serves both the
+    cancel and the execute case.
+    """
+    from consensus.standing_payments import (
+        SCHEDULE_WEEKLY, StandingPaymentEntry)
+    book = chain_state._lifecycle_manager.standing_payments
+    entry = StandingPaymentEntry(
+        payer_pubkey=SENDER, recipient_pubkey=RECIPIENT, amount=100,
+        schedule_kind=SCHEDULE_WEEKLY, signed_day=0, anchor_ts=TIP_TS,
+        window_seconds=604800, final_ts=0, max_occurrences=10000,
+        max_total=0, fee_limit=0, policy_version_ref=0,
+        allow_catch_up=False, version=1)
+    if book.get(entry.auth_id) is None:
+        book.create(entry, TIP_TS)
+    return entry.auth_id.hex()
 
 
 def _seed_open_park():
