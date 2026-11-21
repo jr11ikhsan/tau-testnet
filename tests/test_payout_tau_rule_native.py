@@ -38,8 +38,12 @@ declared set and caps, and applies the legs.
 A second test pins cap enforcement at engine level: a clause naming a
 600 leg under a declared 500 per-execution cap settles nothing — refused
 at admission, and refused again at inclusion with admission bypassed.
-Assertions are deltas around the measured blocks, so faucet grants at
-account creation cannot pollute them.
+Its control settles the same-shaped clause with a valid 400 leg, and a
+duplicate-index test plus its distinct-index control pin the strict
+decode the same way: the controls are what attribute each refusal to
+the book, not to a clause that never stepped. Assertions are deltas
+around the measured blocks, so faucet grants at account creation
+cannot pollute them.
 
 A further test pins the periods_from anchor on the real engine: a rule
 installed now whose periods count from two weeks in the past settles
@@ -49,11 +53,14 @@ clause deliberately READS an input stream (i1, the base amount): a
 clause that reads no input stream cannot be stepped by the policy
 worker at all (the worker's build probe names the case — "clause
 cannot be evaluated: it reads no input stream" — and a step attempt
-is refused the same way). The constant clauses of the cap and
-duplicate tests above never exposed this: every assertion of theirs
-is negative, so a step refusal and a book refusal look identical to
-them. A positive settlement test has no such cover, so its clause
-must be a reading clause, like the grant example's.
+is refused the same way). The cap and duplicate tests above were
+originally written with constant clauses and never exposed this:
+every assertion of theirs is negative, so a step refusal and a book
+refusal look identical to them. Their clauses now gate on i1 like
+this one's, and each carries a settling control with valid legs, so
+their refusals are attributable to the book's cap check and strict
+decode. A positive settlement test has no such cover either way, so
+its clause must be a reading clause, like the grant example's.
 """
 import json
 import os
@@ -331,10 +338,23 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
 
     def test_clause_leg_above_per_execution_cap_settles_nothing(self):
         now = int(time.time())
+        # The clause GATES ON i1 (no legs unless the submitted base is
+        # positive) so the policy worker can step it: a clause reading
+        # no input stream cannot be stepped at all, and a step refusal
+        # would be indistinguishable from the book refusal this test
+        # exists to prove. With base 1 the gate selects the leg branch
+        # and the stepped clause names exactly the leg it always did:
+        # 600 to candidate 0, above the declared 500 cap. The control
+        # test below settles the same-shaped clause with a valid leg,
+        # which is what attributes this refusal to the cap check.
         clause = (
-            "((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
             "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
-            "&& (o32[t]:bv[64] = { 600 }:bv[64]))"
+            "&& (o32[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 600 }:bv[64])))"
         )
         entry = PayoutRuleEntry(
             owner_pubkey=OWNER, recipients=(BOB,), legs=(),
@@ -359,19 +379,71 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("66" * 32)))
 
+    def test_clause_leg_under_cap_settles(self):
+        # Control for the cap test above: the same i1-gated clause
+        # shape naming a VALID leg (400 under the same declared 500
+        # per-execution cap) settles in full. The control is what
+        # proves the over-cap refusal is the book's cap check and not
+        # a clause that never stepped: this clause demonstrably steps
+        # and settles through the same admission and inclusion path.
+        now = int(time.time())
+        clause = (
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 400 }:bv[64])))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=0,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "99" * 32, 1), propagate=False)
+        self.assertTrue(res["ok"], f"under-cap execution rejected: {res}")
+        self._mine()
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 400)
+        self.assertEqual(after[OWNER] - before[OWNER], -400)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertTrue(book.is_settled(entry.rule_id, bytes.fromhex("99" * 32)))
+        record = book.settlement(entry.rule_id, bytes.fromhex("99" * 32))
+        self.assertIsNotNone(record)
+        self.assertEqual(record.total, 400)
+
     def test_clause_duplicate_candidate_index_settles_nothing(self):
         # A candidate named twice is malformed output, not two legs: the
         # whole execution settles nothing — refused at admission, and
         # refused again at inclusion with admission bypassed. The total
         # (150) is under the declared 500 per-execution cap, so only the
-        # duplicate rule can refuse this execution.
+        # duplicate rule can refuse this execution. The clause gates on
+        # i1 so the worker can step it (a constant clause cannot be
+        # stepped, and its step refusal would look exactly like this
+        # book refusal); with base 1 the gate selects the leg branch
+        # and the stepped clause names exactly the legs it always did.
+        # The control test below settles the same-shaped clause with
+        # distinct indices, which is what attributes this refusal to
+        # the duplicate rule.
         now = int(time.time())
         clause = (
-            "((o30[t]:bv[64] = { 2 }:bv[64]) "
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o33[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o34[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 2 }:bv[64]) "
             "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
             "&& (o32[t]:bv[64] = { 100 }:bv[64]) "
             "&& (o33[t]:bv[64] = { 0 }:bv[64]) "
-            "&& (o34[t]:bv[64] = { 50 }:bv[64]))"
+            "&& (o34[t]:bv[64] = { 50 }:bv[64])))"
         )
         entry = PayoutRuleEntry(
             owner_pubkey=OWNER, recipients=(BOB,), legs=(),
@@ -395,6 +467,52 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         self.assertEqual(after[OWNER] - before[OWNER], 0)
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("77" * 32)))
+
+    def test_clause_distinct_candidate_indices_settle(self):
+        # Control for the duplicate test above: the same i1-gated
+        # clause shape naming two DISTINCT candidate indices (100 to
+        # candidate 0, 50 to candidate 1 — the same total 150 under
+        # the same declared 500 cap) settles in full. The control is
+        # what proves the duplicate refusal is the strict decode rule
+        # and not a clause that never stepped: this clause
+        # demonstrably steps and settles through the same admission
+        # and inclusion path.
+        now = int(time.time())
+        clause = (
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o33[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o34[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 2 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64]) "
+            "&& (o33[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o34[t]:bv[64] = { 50 }:bv[64])))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB, FUNDER), legs=(),
+            max_per_execution=500, max_per_period=0,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "cc" * 32, 1), propagate=False)
+        self.assertTrue(res["ok"], f"distinct-index execution rejected: {res}")
+        self._mine()
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 100)
+        self.assertEqual(after[FUNDER] - before[FUNDER], 50)
+        self.assertEqual(after[OWNER] - before[OWNER], -150)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertTrue(book.is_settled(entry.rule_id, bytes.fromhex("cc" * 32)))
+        record = book.settlement(entry.rule_id, bytes.fromhex("cc" * 32))
+        self.assertIsNotNone(record)
+        self.assertEqual(record.total, 150)
 
     def test_anchored_grid_counts_the_settlement_in_period_2(self):
         # periods_from two weeks in the past: the wall-clock execution
