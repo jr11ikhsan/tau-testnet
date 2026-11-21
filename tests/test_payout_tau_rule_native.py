@@ -44,7 +44,15 @@ account creation cannot pollute them.
 A further test pins the periods_from anchor on the real engine: a rule
 installed now whose periods count from two weeks in the past settles
 its execution against anchored period 2 — the book's period total
-lands under index 2, not under the install grid's period 0.
+lands under index 2, not under the install grid's period 0. It is
+named to run BEFORE the grant example in unittest's alphabetical
+order: after that test's heavy clause work in the shared admission
+worker, a first step for a new clause is refused by the pooled worker
+("policy clause cannot be evaluated on these inputs", two CI runs,
+same head, deterministic) — the pooled-worker hazard shape documented
+on PR #141 and probed by the poolcheck suite. The refusal is a worker
+state artifact, not a verdict on the clause: the same clause shape
+steps cleanly earlier in the process.
 """
 import json
 import os
@@ -387,12 +395,17 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("77" * 32)))
 
-    def test_periods_from_counts_the_settlement_on_the_anchored_grid(self):
+    def test_anchored_grid_counts_the_settlement_in_period_2(self):
         # periods_from two weeks in the past: the wall-clock execution
         # lands in anchored period 2, while the install-anchored grid
         # would call it period 0. The clause pays a fixed 100 to Bob;
         # the settlement must be counted against anchored period 2 —
         # period_total(rule_id, 2) is 100 and period 0 stays empty.
+        # Named to sort before the grant example (see module docstring):
+        # after that test's clause work, the shared admission worker
+        # refuses a first step for a new clause — the pooled-worker
+        # hazard, not this clause (identical in shape to the cap
+        # test's, which steps cleanly earlier in the process).
         now = int(time.time())
         clause = (
             "((o30[t]:bv[64] = { 1 }:bv[64]) "
