@@ -44,15 +44,16 @@ account creation cannot pollute them.
 A further test pins the periods_from anchor on the real engine: a rule
 installed now whose periods count from two weeks in the past settles
 its execution against anchored period 2 — the book's period total
-lands under index 2, not under the install grid's period 0. It is
-named to run BEFORE the grant example in unittest's alphabetical
-order: after that test's heavy clause work in the shared admission
-worker, a first step for a new clause is refused by the pooled worker
-("policy clause cannot be evaluated on these inputs", two CI runs,
-same head, deterministic) — the pooled-worker hazard shape documented
-on PR #141 and probed by the poolcheck suite. The refusal is a worker
-state artifact, not a verdict on the clause: the same clause shape
-steps cleanly earlier in the process.
+lands under index 2, not under the install grid's period 0. Its
+clause deliberately READS an input stream (i1, the base amount): a
+clause that reads no input stream cannot be stepped by the policy
+worker at all (the worker's build probe names the case — "clause
+cannot be evaluated: it reads no input stream" — and a step attempt
+is refused the same way). The constant clauses of the cap and
+duplicate tests above never exposed this: every assertion of theirs
+is negative, so a step refusal and a book refusal look identical to
+them. A positive settlement test has no such cover, so its clause
+must be a reading clause, like the grant example's.
 """
 import json
 import os
@@ -398,19 +399,21 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
     def test_anchored_grid_counts_the_settlement_in_period_2(self):
         # periods_from two weeks in the past: the wall-clock execution
         # lands in anchored period 2, while the install-anchored grid
-        # would call it period 0. The clause pays a fixed 100 to Bob;
-        # the settlement must be counted against anchored period 2 —
+        # would call it period 0. The clause pays a fixed 100 to Bob
+        # whenever the submitted base is positive (always true of a
+        # valid execution — and the read of i1 is what makes the
+        # clause steppable at all; see the module docstring); the
+        # settlement must be counted against anchored period 2 —
         # period_total(rule_id, 2) is 100 and period 0 stays empty.
-        # Named to sort before the grant example (see module docstring):
-        # after that test's clause work, the shared admission worker
-        # refuses a first step for a new clause — the pooled-worker
-        # hazard, not this clause (identical in shape to the cap
-        # test's, which steps cleanly earlier in the process).
         now = int(time.time())
         clause = (
-            "((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "((i1[t]:bv[64] < { 1 }:bv[64]) "
+            "? ((o30[t]:bv[64] = { 0 }:bv[64]) "
             "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
-            "&& (o32[t]:bv[64] = { 100 }:bv[64]))"
+            "&& (o32[t]:bv[64] = { 0 }:bv[64])) "
+            ": ((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64])))"
         )
         entry = PayoutRuleEntry(
             owner_pubkey=OWNER, recipients=(BOB,), legs=(),
