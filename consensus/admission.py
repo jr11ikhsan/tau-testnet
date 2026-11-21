@@ -1954,6 +1954,8 @@ def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
         int(row.get("form", 1)),
         str(row.get("clause_text", "")),
     )
+    if int(row.get("periods_from_ts", 0)):
+        entry_row = entry_row + (int(row["periods_from_ts"]),)
     settlement_rows = [
         (
             bytes.fromhex(row["rule_id"]),

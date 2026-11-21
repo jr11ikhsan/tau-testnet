@@ -604,7 +604,8 @@ class TipAdmissionView:
         row = next(r for r in book.rows() if r[0] == entry.rule_id)
         (rule_id, owner, recipients, legs, max_exec, max_period,
          period_seconds, anchor, version, period_totals,
-         form, clause_text) = row
+         form, clause_text) = row[:12]
+        periods_from = int(row[12]) if len(row) > 12 else 0
         ts = self.next_block_timestamp
         period = period_index_at(entry, ts)
         return {
@@ -621,6 +622,7 @@ class TipAdmissionView:
             "max_per_period": max_period,
             "period_seconds": period_seconds,
             "period_anchor_ts": anchor,
+            "periods_from_ts": periods_from,
             "version": version,
             "period_totals": [
                 {"period_index": i, "total": t} for i, t in period_totals

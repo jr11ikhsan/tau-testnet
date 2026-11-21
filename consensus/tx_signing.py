@@ -204,6 +204,7 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_max_per_period"] = payload.get("payout_max_per_period")
         signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
         signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
+        signing_dict["payout_periods_from_ts"] = payload.get("payout_periods_from_ts")
         signing_dict["payout_version"] = payload.get("payout_version")
     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
         # Nothing beyond the signer's identity (sender_pubkey is always

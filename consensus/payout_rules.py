@@ -61,6 +61,18 @@ make two honest nodes disagree about admissibility, which forks.
   per-period cap, settles nothing. The period is a fixed-length window
   from the rule's signed anchor (period_seconds), the standing book's
   fixed-schedule arithmetic; per-period paid totals are book state.
+- Period origin: by default the grid counts from the rule's recorded
+  anchor — in practice the install moment, so "500 a week from
+  1 December" counts its weeks from whenever the rule happened to be
+  installed. An entry may instead carry a signed `periods_from` anchor
+  (a fixed start date, e.g. 1 December): when it is set, EVERY period
+  computation — the per-period cap totals and the i26 paid-total feed
+  alike — counts from that date, and the install moment only decides
+  from when the rule exists. The anchor is optional and additive: an
+  entry without it is byte-identical to before (same rule id, same
+  stored row, same book root), and an entry with it hashes the anchor
+  into its rule id under its own domain, so the two spellings of the
+  same terms are different rules with different period grids.
 - An execution that cannot settle settles NOTHING: no leg moves, no
   settlement is recorded, no period total advances — the same discipline
   as a standing payment's insufficient-funds occurrence, so a retry with
@@ -85,6 +97,7 @@ from consensus.payment_calendar import SECONDS_PER_DAY
 from consensus.serialization import (
     compute_payout_rule_book_root,
     compute_payout_rule_id,
+    compute_payout_rule_periods_from_id,
     compute_payout_rule_tau_id,
 )
 
@@ -130,6 +143,12 @@ MAX_RECIPIENTS = 32
 MAX_LEGS = 32
 MAX_PERIOD_SECONDS = 366 * SECONDS_PER_DAY
 
+# A periods_from anchor further than this from the install moment, in
+# either direction, is a mistake, not a schedule: the module's own
+# longest period. A fixed start a year out (or a grid that began a year
+# ago) is the extreme a considered choice ever needs.
+MAX_PERIODS_FROM_SKEW_SECONDS = MAX_PERIOD_SECONDS
+
 _PUBKEY_RE = re.compile(r"^[0-9a-f]{96}$")
 _ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _U64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -160,6 +179,11 @@ class PayoutRuleEntry:
     `form` and `clause_text` default to the declared-program form, so every
     entry constructed before the Tau form existed — and every declared-form
     entry constructed now — is byte-identical to what it was.
+    `periods_from_ts` follows the same discipline: 0 (the default) means
+    the entry carries no periods_from anchor and is byte-identical to
+    before the field existed — same rule id, same stored row; a nonzero
+    value is the signed fixed start the period grid counts from, and it
+    is inside the rule id under its own domain.
     """
 
     owner_pubkey: str
@@ -172,9 +196,27 @@ class PayoutRuleEntry:
     version: int
     form: int = FORM_DECLARED_PROGRAM
     clause_text: str = ""
+    periods_from_ts: int = 0
 
     @property
     def rule_id(self) -> bytes:
+        if self.periods_from_ts:
+            return compute_payout_rule_periods_from_id(
+                self.owner_pubkey,
+                self.recipients,
+                tuple(
+                    (leg.recipient_pubkey, leg.mode, leg.value)
+                    for leg in self.legs
+                ),
+                self.clause_text,
+                self.form,
+                self.max_per_execution,
+                self.max_per_period,
+                self.period_seconds,
+                self.period_anchor_ts,
+                self.periods_from_ts,
+                self.version,
+            )
         if self.form == FORM_TAU_RULE:
             return compute_payout_rule_tau_id(
                 self.owner_pubkey,
@@ -230,11 +272,24 @@ class PayoutDecision:
     period_total_after: int
 
 
+def period_origin(entry: PayoutRuleEntry) -> int:
+    """Where the entry's period grid starts counting from.
+
+    The signed periods_from anchor when the entry carries one; otherwise
+    the recorded anchor (in practice the install moment). ONE definition:
+    the per-period cap totals, the i26 paid-total feed and every other
+    period answer derive from period_index_at, so the two spellings of a
+    rule can never disagree about which period a timestamp lands in.
+    """
+    return entry.periods_from_ts or entry.period_anchor_ts
+
+
 def period_index_at(entry: PayoutRuleEntry, ts: int) -> int:
-    """Which period contains `ts`; -1 before the anchor."""
-    if ts < entry.period_anchor_ts:
+    """Which period contains `ts`; -1 before the period origin."""
+    origin = period_origin(entry)
+    if ts < origin:
         return -1
-    return (ts - entry.period_anchor_ts) // entry.period_seconds
+    return (ts - origin) // entry.period_seconds
 
 
 def compute_legs(
@@ -490,6 +545,7 @@ def parse_install_payout_rule(tx: Dict[str, Any]) -> PayoutRuleEntry:
         version=_u64_field(tx, "payout_version", default=1),
         form=form,
         clause_text=clause_text,
+        periods_from_ts=_u64_field(tx, "payout_periods_from_ts"),
     )
 
 
@@ -560,6 +616,22 @@ def validate_payout_rule_shape(
         return "payout_max_per_period exceeds the maximum transfer value"
     if not 1 <= entry.period_seconds <= MAX_PERIOD_SECONDS:
         return f"payout_period_seconds must be in 1..{MAX_PERIOD_SECONDS}"
+    if entry.periods_from_ts:
+        # A fixed start date is a considered choice near the install:
+        # the official shape is days or weeks away (install in late
+        # November, periods from 1 December; or a mid-period install
+        # whose grid began earlier in the month). An anchor a full
+        # longest-period away in either direction is a mistake.
+        if not (
+            now_ts - MAX_PERIODS_FROM_SKEW_SECONDS
+            <= entry.periods_from_ts
+            <= now_ts + MAX_PERIODS_FROM_SKEW_SECONDS
+        ):
+            return (
+                "payout_periods_from_ts must lie within "
+                f"{MAX_PERIODS_FROM_SKEW_SECONDS} seconds of the "
+                "installation time"
+            )
     if entry.version < 1:
         return "payout_version must start at 1"
     return None
@@ -567,9 +639,14 @@ def validate_payout_rule_shape(
 
 # --- The book ------------------------------------------------------------------
 
+# A stored entry row. Rows written before periods_from existed carry the
+# first twelve fields exactly; a row for an entry WITH a periods_from
+# anchor appends it as a thirteenth. restore() accepts both shapes, and
+# rows() emits the twelfth-field shape whenever the anchor is unset, so
+# an existing book's stored rows never change under it.
 _EntryRow = Tuple[
     bytes, str, Tuple[str, ...], Tuple[Tuple[str, int, int], ...],
-    int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str,
+    int, int, int, int, int, Tuple[Tuple[int, int], ...], int, str, int,
 ]
 _SettlementRow = Tuple[bytes, bytes, int, int, int]
 
@@ -615,13 +692,14 @@ class PayoutRuleBook:
         for row in rows:
             (rule_id, owner, recipients, legs, max_exec, max_period,
              period_seconds, anchor, version, period_totals,
-             form, clause_text) = row
+             form, clause_text) = row[:12]
+            periods_from = int(row[12]) if len(row) > 12 else 0
             entry = PayoutRuleEntry(
                 owner,
                 tuple(recipients),
                 tuple(PayoutLeg(r, m, v) for r, m, v in legs),
                 max_exec, max_period, period_seconds, anchor, version,
-                form, clause_text,
+                form, clause_text, periods_from,
             )
             if entry.rule_id != bytes(rule_id):
                 raise ValueError(
@@ -653,25 +731,26 @@ class PayoutRuleBook:
         out: List[_EntryRow] = []
         for entry in self._entries.values():
             totals = self._period_totals.get(entry.rule_id, {})
-            out.append(
-                (
-                    entry.rule_id,
-                    entry.owner_pubkey,
-                    entry.recipients,
-                    tuple(
-                        (leg.recipient_pubkey, leg.mode, leg.value)
-                        for leg in entry.legs
-                    ),
-                    entry.max_per_execution,
-                    entry.max_per_period,
-                    entry.period_seconds,
-                    entry.period_anchor_ts,
-                    entry.version,
-                    tuple(sorted(totals.items())),
-                    entry.form,
-                    entry.clause_text,
-                )
+            row = (
+                entry.rule_id,
+                entry.owner_pubkey,
+                entry.recipients,
+                tuple(
+                    (leg.recipient_pubkey, leg.mode, leg.value)
+                    for leg in entry.legs
+                ),
+                entry.max_per_execution,
+                entry.max_per_period,
+                entry.period_seconds,
+                entry.period_anchor_ts,
+                entry.version,
+                tuple(sorted(totals.items())),
+                entry.form,
+                entry.clause_text,
             )
+            if entry.periods_from_ts:
+                row = row + (entry.periods_from_ts,)
+            out.append(row)
         return out
 
     def settlement_rows(self) -> List[_SettlementRow]:
@@ -973,6 +1052,12 @@ def payout_rule_capabilities() -> Dict[str, Any]:
         "caps": (
             "declared per execution and per period; 0 leaves that "
             "dimension uncapped"
+        ),
+        "periods_from": (
+            "optional signed anchor (payout_periods_from_ts): when set, "
+            "periods count from that fixed start instead of the install "
+            "anchor; when unset, the grid counts from the recorded "
+            "period anchor exactly as before"
         ),
         "settlement": (
             "recorded by settlement id; a settled execution never pays twice"

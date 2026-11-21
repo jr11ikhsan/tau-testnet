@@ -40,6 +40,11 @@ A second test pins cap enforcement at engine level: a clause naming a
 at admission, and refused again at inclusion with admission bypassed.
 Assertions are deltas around the measured blocks, so faucet grants at
 account creation cannot pollute them.
+
+A further test pins the periods_from anchor on the real engine: a rule
+installed now whose periods count from two weeks in the past settles
+its execution against anchored period 2 — the book's period total
+lands under index 2, not under the install grid's period 0.
 """
 import json
 import os
@@ -381,6 +386,40 @@ class TestPayoutTauRuleNativeE2E(unittest.TestCase):
         self.assertEqual(after[OWNER] - before[OWNER], 0)
         book = chain_state._lifecycle_manager.payout_rules
         self.assertFalse(book.is_settled(entry.rule_id, bytes.fromhex("77" * 32)))
+
+    def test_periods_from_counts_the_settlement_on_the_anchored_grid(self):
+        # periods_from two weeks in the past: the wall-clock execution
+        # lands in anchored period 2, while the install-anchored grid
+        # would call it period 0. The clause pays a fixed 100 to Bob;
+        # the settlement must be counted against anchored period 2 —
+        # period_total(rule_id, 2) is 100 and period 0 stays empty.
+        now = int(time.time())
+        clause = (
+            "((o30[t]:bv[64] = { 1 }:bv[64]) "
+            "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+            "&& (o32[t]:bv[64] = { 100 }:bv[64]))"
+        )
+        entry = PayoutRuleEntry(
+            owner_pubkey=OWNER, recipients=(BOB,), legs=(),
+            max_per_execution=500, max_per_period=500,
+            period_seconds=WEEK, period_anchor_ts=now - 100, version=1,
+            form=FORM_TAU_RULE, clause_text=clause,
+            periods_from_ts=now - 2 * WEEK,
+        )
+        chain_state._lifecycle_manager.payout_rules.install(entry, now)
+
+        before = self._balances()
+        res = sendtx.queue_transaction(
+            self._execute_tx(entry.rule_id, "88" * 32, 1), propagate=False)
+        self.assertTrue(res["ok"], f"anchored execution rejected: {res}")
+        self._mine()
+        after = self._balances()
+        self.assertEqual(after[BOB] - before[BOB], 100)
+        self.assertEqual(after[OWNER] - before[OWNER], -100)
+        book = chain_state._lifecycle_manager.payout_rules
+        self.assertTrue(book.is_settled(entry.rule_id, bytes.fromhex("88" * 32)))
+        self.assertEqual(book.period_total(entry.rule_id, 2), 100)
+        self.assertEqual(book.period_total(entry.rule_id, 0), 0)
 
 
 if __name__ == "__main__":
