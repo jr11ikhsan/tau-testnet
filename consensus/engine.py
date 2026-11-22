@@ -68,6 +68,7 @@ from .receive_routes import (
     parse_remove_receive_route,
 )
 from .standing_payments import (
+    MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK,
     STANDING_PAYMENT_TX_TYPES,
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
@@ -369,6 +370,80 @@ def _refund_expired_grants(lm, balances, sequences, timestamp) -> List[Dict[str,
             "funder_pubkey": entry.funder_pubkey,
             "beneficiary_pubkey": entry.beneficiary_pubkey,
             "amount": amount,
+        })
+    return events
+
+
+def _settle_due_standing_payments(
+    lm, balances, sequences, timestamp, last_transfer_ts=None,
+    eligible_ids=None,
+) -> List[Dict[str, Any]]:
+    """Settle due standing-payment periods node-side; returns the events.
+
+    The due sweep runs in the same block sweep as the grant refunds,
+    after the transaction loop, so a transaction execution in this block
+    settles first and the sweep sees the period already settled — a
+    period can never be paid twice. Each candidate is settled through
+    the book's own execute(), the same evaluation a transaction
+    execution faces (live window, end conditions, per-period caps,
+    signed catch-up only), against the payer's post-transaction balance.
+    At most MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK settlements land per
+    block, earliest due first; the rest are candidates again next block.
+
+    The movement is the sweep's, not a transaction's: no fee is charged
+    and none is reimbursed, whoever might have triggered it, and the
+    balances move directly, so the credit is a node-made credit that
+    never enters the transfer seam — it cannot trigger a receive route
+    and cannot re-trigger, the construction the execution path's fee
+    reimbursement already relies on. An authorization whose payer cannot
+    pay in full settles nothing and advances no marker: later blocks
+    retry it while its window is live, and once the window lapses the
+    period is skipped — never a debt, never a partial payment.
+
+    `eligible_ids` carries the authorizations installed at the START of
+    this block: the sweep is a pass over the state earlier blocks
+    committed, so an authorization is never settled in the block that
+    installed it — the transaction loop owns its own block, and an
+    execution or cancellation in the install block is never pre-empted.
+    """
+    book = _standing_payment_book(lm)
+    if book is None:
+        return []
+    events: List[Dict[str, Any]] = []
+    grant = faucet.amount(lm)
+    settled = 0
+    for entry in book.due_sweep_candidates(int(timestamp), eligible_ids):
+        if settled >= MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK:
+            break
+        decision = book.execute(
+            entry.auth_id,
+            int(timestamp),
+            int(balances.get(entry.payer_pubkey, 0)),
+        )
+        if not decision.executed:
+            continue
+        balances[entry.payer_pubkey] = (
+            int(balances.get(entry.payer_pubkey, 0)) - decision.amount
+        )
+        balances[entry.recipient_pubkey] = faucet.spendable(
+            balances, sequences, entry.recipient_pubkey, grant
+        ) + decision.amount
+        if last_transfer_ts is not None:
+            # The payer made a transfer: stamp their transfer history,
+            # as the transaction execution path does.
+            last_transfer_ts[entry.payer_pubkey] = int(timestamp)
+        settled += 1
+        events.append({
+            "auth_id": entry.auth_id.hex(),
+            "action": "executed",
+            "payer_pubkey": entry.payer_pubkey,
+            "recipient_pubkey": entry.recipient_pubkey,
+            "amount": decision.amount,
+            "period_index": decision.period_index,
+            "periods_collected": decision.periods_collected,
+            "total_paid": decision.total_paid_after,
+            "executor_pubkey": None,
+            "swept": True,
         })
     return events
 
@@ -997,6 +1072,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             proposal.lifecycle = lm
         parent_total += _escrow_total(lm)
 
+        # The due sweep at the end of this block settles only the
+        # authorizations installed at its START (the state earlier blocks
+        # committed): capture their ids before the transaction loop runs.
+        _sp_book_at_start = _standing_payment_book(lm)
+        standing_ids_at_block_start = (
+            _sp_book_at_start.authorization_ids()
+            if _sp_book_at_start is not None else frozenset()
+        )
+
         # 2. Pure Transaction Simulation (Internal Layer)
         # We pass target_balances and target_sequences to self.apply which mutates them internally.
         # This acts as our pure executor since t_bals/t_seqs are local copies.
@@ -1037,6 +1121,15 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         # exactly what is left. Fee-free, like every sweep movement.
         refunded_grants = _refund_expired_grants(
             lm, t_bals, t_seqs, block.header.timestamp
+        )
+        # Standing payments settle in the same sweep: a due period no
+        # longer waits for an executor willing to front the fee. The
+        # sweep runs after the transaction loop, so an execution in this
+        # block wins and the sweep pays what is still due — never twice.
+        # Fee-free, like every sweep movement.
+        settled_standing = _settle_due_standing_payments(
+            lm, t_bals, t_seqs, block.header.timestamp, t_lts,
+            eligible_ids=standing_ids_at_block_start,
         )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
@@ -1111,8 +1204,9 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 routing_events.extend(entries)
 
         # Standing-payment events (#34): creates, cancels and executions
-        # that stayed accepted, in transaction order — carried on the
-        # snapshot exactly as the routing events are, for history to record.
+        # that stayed accepted, in transaction order, then this block's
+        # due-sweep settlements — carried on the snapshot exactly as the
+        # routing events are, for history to record.
         standing_payment_events = []
         for i, tx in enumerate(block.transactions):
             event = (exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}).get(
@@ -1120,6 +1214,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             )
             if event and id(tx) in accepted_obj:
                 standing_payment_events.append(event)
+        standing_payment_events.extend(settled_standing)
 
         # Payout-rule events (#63): installs, removals and executions that
         # stayed accepted, in transaction order — carried on the snapshot

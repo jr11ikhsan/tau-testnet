@@ -201,6 +201,57 @@ class TestStandingPaymentsNativeE2E(unittest.TestCase):
         res = sendtx.queue_transaction(self._execute_tx(entry.auth_id), propagate=False)
         self.assertFalse(res["ok"], f"second execution admitted: {res}")
 
+    def test_due_sweep_settles_without_any_transaction_on_the_native_engine(self):
+        """Fix-3: a due period is settled by the node's own block sweep.
+
+        The authorization (two occurrences allowed, so nothing ends) is
+        already due. An EMPTY block — no transaction from anyone — must
+        settle the period: the recipient up by the amount, the payer
+        down by exactly the amount, and no fee taken from any account
+        (there is no executor to pay one, and the sweep charges none).
+        A second empty block settles nothing more, and a transaction
+        execution for the swept period is refused at admission: the
+        sweep never double-pays.
+        """
+        now = int(time.time())
+        entry = StandingPaymentEntry(
+            payer_pubkey=PAYER, recipient_pubkey=RECIPIENT, amount=AMOUNT,
+            schedule_kind=SCHEDULE_DAILY, signed_day=0, anchor_ts=now - 100,
+            window_seconds=3600, final_ts=0, max_occurrences=2, max_total=0,
+            fee_limit=0, policy_version_ref=0, allow_catch_up=False, version=1,
+        )
+        chain_state._lifecycle_manager.standing_payments.create(entry, now)
+
+        before = {pk: chain_state._balances.get(pk, 0)
+                  for pk in (PAYER, RECIPIENT, EXECUTOR)}
+        block_res = createblock.create_block_from_mempool(allow_empty=True)
+        self.assertEqual(len(block_res.get("transactions", [])), 0, block_res)
+        after = {pk: chain_state._balances.get(pk, 0)
+                 for pk in (PAYER, RECIPIENT, EXECUTOR)}
+        book = chain_state._lifecycle_manager.standing_payments
+
+        self.assertEqual(after[RECIPIENT] - before[RECIPIENT], AMOUNT)
+        self.assertEqual(after[PAYER] - before[PAYER], -AMOUNT)
+        # No transaction existed, so no fee could move: the third
+        # account is untouched to the unit.
+        self.assertEqual(after[EXECUTOR], before[EXECUTOR])
+        self.assertEqual(book.total_executed(entry.auth_id), (1, AMOUNT))
+        (fact,) = book.facts_for(entry.auth_id)
+        self.assertEqual(fact.period_index, 0)
+
+        # A second empty block settles nothing more (the next period is
+        # a day away), and the swept period refuses a transaction
+        # execution at admission — exactly one settlement, ever.
+        block_res = createblock.create_block_from_mempool(allow_empty=True)
+        self.assertEqual(len(block_res.get("transactions", [])), 0, block_res)
+        self.assertEqual(
+            chain_state._balances.get(RECIPIENT, 0) - before[RECIPIENT], AMOUNT)
+        self.assertEqual(
+            chain_state._lifecycle_manager.standing_payments.total_executed(
+                entry.auth_id), (1, AMOUNT))
+        res = sendtx.queue_transaction(self._execute_tx(entry.auth_id), propagate=False)
+        self.assertFalse(res["ok"], f"execution of a swept period admitted: {res}")
+
 
 if __name__ == "__main__":
     unittest.main()

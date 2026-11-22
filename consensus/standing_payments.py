@@ -34,6 +34,16 @@ make two honest nodes disagree about admissibility, which forks.
   stored entry. Amount, recipient, cadence, expiry and fee terms are the
   entry's, and the authorization's identity is a hash of exactly those
   fields, so a tampered copy is a different, unknown authorization.
+- A due period does not wait for an executor: at the end of every block
+  the node itself settles due periods through this same evaluation (the
+  due sweep — `due_sweep_candidates` here, the movement in the engine's
+  block sweep), at most MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK per block,
+  earliest due first, with no transaction and no fee. The sweep changes
+  no semantics: it settles only inside a live window, an insufficient
+  balance settles nothing and is retried by later blocks while the
+  window is live, and a lapsed period is skipped exactly as an
+  execution would skip it — catch-up only where the signed terms
+  permit it, for sweep and transaction alike.
 - Update is a new version that supersedes, never an invisible mutation.
   Progress does not carry across versions (the terms may have changed);
   paid-for-period facts are history and are never rewritten.
@@ -84,6 +94,11 @@ _FIXED_PERIOD_SECONDS = {
     SCHEDULE_DAILY: SECONDS_PER_DAY,
     SCHEDULE_WEEKLY: SECONDS_PER_WEEK,
 }
+
+# The due sweep's per-block settlement cap: a consensus constant, like the
+# window caps — a per-node value would let two honest nodes settle a
+# different prefix of the same due list and fork.
+MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK = 16
 
 # One signed execution window per period. A window may never reach a second
 # period's due date, so the caps are the shortest possible period lengths.
@@ -563,6 +578,51 @@ class StandingPaymentBook:
                 return due
             period += 1
 
+    def authorization_ids(self) -> frozenset:
+        """The ids installed in the book, as an immutable snapshot."""
+        return frozenset(self._entries)
+
+    def due_sweep_candidates(
+        self, ts: int, eligible_ids: Optional[frozenset] = None
+    ) -> List[StandingPaymentEntry]:
+        """Authorizations the due sweep should settle at `ts`, in sweep order.
+
+        `eligible_ids`, when given, restricts the sweep to authorizations
+        in that set: the engine passes the ids installed at the START of
+        the block, so the sweep — an end-of-block pass over the state
+        earlier blocks committed — never settles an authorization in the
+        block that installed it; the transaction loop owns its own block.
+
+        An authorization is a candidate exactly when an execution at `ts`
+        with an unbounded balance would settle: the same evaluation a
+        transaction execution faces, so the sweep can never settle what
+        an execution would refuse (cancelled, ended, not yet due, window
+        lapsed, period already settled without signed catch-up, end
+        condition reached). Balance is deliberately not part of the
+        preview: the engine re-evaluates each candidate against the
+        payer's live balance as it settles, in this order, so an
+        authorization drained by an earlier settlement in the same sweep
+        settles nothing and advances no marker, exactly as an execution
+        against that balance would refuse.
+
+        Order is deterministic across nodes: earliest due first (the due
+        date of the earliest period the settlement would collect), ties
+        broken by authorization id. At most
+        MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK of the returned entries are
+        settled per block; the rest are candidates again next block.
+        """
+        scored: List[Tuple[int, bytes, StandingPaymentEntry]] = []
+        for auth_id, entry in self._entries.items():
+            if eligible_ids is not None and auth_id not in eligible_ids:
+                continue
+            progress = self._progress[auth_id]
+            decision, to_settle = self._evaluate(entry, progress, ts, 1 << 62)
+            if not decision.executed:
+                continue
+            scored.append((due_ts(entry, min(to_settle)), auth_id, entry))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [entry for _, _, entry in scored]
+
     # -- creation / update ---------------------------------------------------------
 
     def can_create(
@@ -802,6 +862,13 @@ def standing_payment_capabilities() -> Dict[str, Any]:
             "required: a final period, an occurrence limit, or a maximum total"
         ),
         "execution": "any party may trigger; the signed terms cannot be altered",
+        "due_sweep": (
+            "the node settles due periods itself at the end of every "
+            "block, without a transaction and without a fee, at most "
+            f"{MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK} settlements per "
+            "block, earliest due first, under the same evaluation as "
+            "an execution"
+        ),
         "catch_up": "only when the signed terms permit it",
         "fee": (
             "the submitter pays the ordinary fee; payer funding only under "
