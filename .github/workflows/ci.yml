@@ -122,5 +122,6 @@ jobs:
           tests/test_grants_native.py
           tests/test_paid_fact_native.py
           tests/test_payout_tau_rule_native.py
+          tests/test_payout_periods_from_twonode_native.py
           -p no:asyncio -v
           "
