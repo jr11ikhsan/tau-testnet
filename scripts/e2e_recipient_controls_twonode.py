@@ -368,19 +368,26 @@ def main():
         checkpoint("pre_activation")
 
         # Phase 2: activation through governance update + vote on the
-        # running chain. Patch-only update, scheduled ahead, voted by
-        # the sole validator, landing at its height in block apply.
+        # running chain. The update resubmits the current consensus
+        # rules verbatim (admission requires a non-empty revisions
+        # list; the rules themselves do not change) and carries only
+        # the activation patch. Scheduled ahead, voted by the sole
+        # validator, landing at its height in block apply.
         miner = config.MINER_PUBKEY
         miner_sk = int(config.MINER_PRIVKEY, 16)
         activate_at = int(head_dict()["header"]["block_number"]) + 6
         patch_dict = {"recipient_policy_active": True}
-        update_id = compute_update_id([], activate_at, patch_dict).hex()
+        current_rules = json.load(
+            open("data/genesis.json"))["consensus_rules"]
+        revisions = [current_rules]
+        update_id = compute_update_id(
+            revisions, activate_at, patch_dict).hex()
         upd = cli_tx.build_consensus_rule_update_tx(
             sender_pubkey=miner,
             sequence_number=chain_state.get_sequence_number(miner),
             expiration_time=int(time.time()) + 3600,
             expire_at_height=activate_at + 50,
-            rule_revisions=[], activate_at_height=activate_at,
+            rule_revisions=revisions, activate_at_height=activate_at,
             host_contract_patch=patch_dict)
         res = sendtx.queue_transaction(
             json.dumps(sign_payload(upd, miner_sk)), propagate=False)
