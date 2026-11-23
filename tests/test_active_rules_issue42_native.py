@@ -180,3 +180,131 @@ def test_active_rules_view_under_authority(authority, _mining_allowed):
         getactiverules.execute("getactiverules", container))["data"]
     assert data["effective_spec"] == text
     assert data["spec_hash"] == active_rules.spec_hash_of(text)
+
+
+# --- B02 follow-ups: the resend case A,B,A and the journal forge ---------
+#
+# mendhow's #42 thread and kioway-dev's PR #137 both moved on exactly
+# this ground -- the resend of a displaced unit, and whether the view
+# survives a journal that was altered after the fact. These two tests
+# run both cases on the real engine, under the authoritative worker.
+
+
+def _answer_at(height=None):
+    container = SimpleNamespace(db=db, chain_state=chain_state)
+    raw = "getactiverules" if height is None else f"getactiverules {height}"
+    return json.loads(getactiverules.execute(raw, container))["data"]
+
+
+@pytest.mark.skipif(
+    not _native_available(),
+    reason="native tau-lang bindings not available in this environment",
+)
+def test_resend_a_b_a_under_authority(authority, _mining_allowed):
+    """Send A (o26 = {7} && o27 = {9}), then B (o26 = {3}), then A again,
+    one block each. The view at block 3 runs the first unit's terms
+    again -- the resend is a new revision, not an accumulation replay
+    (which would end at [A, B] with o26 = 3) -- and the ledger names
+    the resend as B's displacer. Then the snapshots are wiped and the
+    same heights must be answered from the journal cut (B02-1), with
+    identical text and hash, marked derived."""
+    sk, pk = _sender("authority-resend")
+    assert _submit(sk, pk, {"0": PROBE_A}, seq=0).get("ok")
+    _mine()
+    assert _submit(sk, pk, {"0": PROBE_B}, seq=1).get("ok")
+    _mine()
+    assert _submit(sk, pk, {"0": PROBE_A}, seq=2).get("ok")
+    _mine()
+
+    at2 = _answer_at(2)
+    assert "o26[t]:bv[24] = { 3 }:bv[24]" in at2["effective_spec"]
+    at3 = _answer_at(3)
+    assert "o26[t]:bv[24] = { 7 }:bv[24]" in at3["effective_spec"]
+    assert "o27[t]:bv[24] = { 9 }:bv[24]" in at3["effective_spec"]
+    assert "{ 3 }" not in at3["effective_spec"]
+
+    receipts = {r["block_height"]: r for r in active_rules.rule_receipts()}
+    first, displaced, resend = receipts[1], receipts[2], receipts[3]
+    assert first["status"] == "in_force"
+    assert displaced["status"] == "displaced"
+    assert displaced["displaced_by"] == [resend["tx_hash"]]
+    assert resend["status"] == "in_force"
+    assert resend["spec_revision_after"] == 3
+
+    snapshots = {h: _answer_at(h) for h in (1, 2, 3)}
+    with db._db_lock:
+        db._db_conn.execute("DELETE FROM spec_snapshots")
+        db._db_conn.commit()
+    assert db.get_latest_spec_snapshot() is None
+    for h in (1, 2, 3):
+        cut = _answer_at(h)
+        assert cut["derived"] == "journal_cut"
+        assert cut["effective_spec"] == snapshots[h]["effective_spec"]
+        assert cut["spec_hash"] == snapshots[h]["spec_hash"]
+        assert cut["spec_revision"] == snapshots[h]["spec_revision"]
+
+
+@pytest.mark.skipif(
+    not _native_available(),
+    reason="native tau-lang bindings not available in this environment",
+)
+def test_forged_journal_fingerprint_rejected_under_authority(
+        authority, _mining_allowed):
+    """Rewrite one entry's recorded result fingerprint in the stored
+    journal, recompute every link, and re-point the commit records at
+    the recomputed links, so the stored chain verifies cleanly and the
+    commits agree with it. The one thing the forge cannot fix is the
+    fingerprint itself: reconstruction recomputes it from the replay,
+    so the rebuild must refuse the journal and serve no spec text."""
+    import tau_journal
+    from dataclasses import replace
+
+    sk, pk = _sender("authority-forge")
+    assert _submit(sk, pk, {"0": PROBE_A}, seq=0).get("ok")
+    _mine()
+    assert _submit(sk, pk, {"0": PROBE_B}, seq=1).get("ok")
+    _mine()
+
+    _reset_spec_mirror()
+    honest = active_rules._authority_spec_text()
+    assert honest is not None
+    assert "o26[t]:bv[24] = { 3 }:bv[24]" in honest
+
+    entries = tau_journal.journal_from_rows(
+        db.committed_journal_entries()).entries()
+    target = next(
+        (e for e in entries if e.kind == tau_journal.STEP), entries[-1])
+    forged_fp = json.dumps(
+        {"outcome": "ACCEPTED_UNCHANGED", "present": [],
+         "progressed": False, "values": {}},
+        sort_keys=True, separators=(",", ":"))
+    old_links = {e.seq: e.link for e in entries}
+    with db._db_lock:
+        cur = db._db_conn.cursor()
+        cur.execute(
+            "UPDATE tau_journal_v1 SET result_fp = ? WHERE seq = ?",
+            (forged_fp, target.seq))
+        prev = None
+        new_links = {}
+        for entry in tau_journal.journal_from_rows(
+                db.committed_journal_entries()).entries():
+            fixed = replace(entry, prev=prev)
+            fixed = replace(fixed, link=fixed.compute_link())
+            new_links[entry.seq] = fixed.link
+            cur.execute(
+                "UPDATE tau_journal_v1 SET prev = ?, link = ? WHERE seq = ?",
+                (fixed.prev, fixed.link, fixed.seq))
+            prev = fixed.link
+        for seq, old_link in old_links.items():
+            cur.execute(
+                "UPDATE block_commits_v1 SET journal_head = ? "
+                "WHERE journal_head = ?",
+                (new_links[seq], old_link))
+        db._db_conn.commit()
+
+    # The forged record verifies: links and commit pointers agree.
+    tau_journal.journal_from_rows(
+        db.committed_journal_entries()).verify_chain()
+    # The rebuild still refuses it -- replay computes another fingerprint.
+    _reset_spec_mirror()
+    assert active_rules._authority_spec_text() is None

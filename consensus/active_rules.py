@@ -27,6 +27,14 @@ the ones that are). This module maintains the corrective view:
 Snapshots are stored data. Replay does not re-run the rules handler, so a
 replayed node verifies the recorded revision progression rather than
 recomputing snapshots; heights before the first snapshot have none.
+
+For those heights the view falls back to the committed journal itself
+(`journal_cut_at_height`): every block commit records the journal head it
+committed, so the spec in force at any held height is the journal cut at
+that head, chain-verified and fed to a one-shot mirror -- the same record
+a reconstruction replays, available for blocks committed before the
+snapshots existed. Answers derived that way are marked
+``derived == "journal_cut"`` so the source is explicit, never silent.
 """
 from __future__ import annotations
 
@@ -147,6 +155,96 @@ def _feed_mirror(iface, text: str) -> None:
     iface.communicate(rule_text=text, target_output_stream_index=0)
 
 
+def _feed_from_scratch(iface, entries) -> None:
+    """Feed a fresh mirror interface a whole journal: the last RESET's
+    units, then every REVISION text after it. The consumption pattern
+    the mirror's rebuild and the journal-cut view share."""
+    import tau_journal
+
+    reset_idx = tau_journal.last_reset_index(entries)
+    start = 0
+    if reset_idx is not None:
+        for text, _persist in entries[reset_idx].units:
+            if text:
+                _feed_mirror(iface, text)
+        start = reset_idx + 1
+    for entry in entries[start:]:
+        if entry.kind == tau_journal.REVISION and entry.rule_text:
+            _feed_mirror(iface, entry.rule_text)
+
+
+def _rebuild_replay_check(journal) -> Optional[bool]:
+    """Full-sample step-fingerprint verification of a mirror rebuild.
+
+    Replays the committed journal through the node's own reconstruction
+    path -- `WorkerSession.reconstruct` with verify=True, the replay a
+    restart performs -- which re-derives every entry's outputs and
+    compares them against the semantic fingerprints recorded at apply.
+    A journal whose recorded step results were forged and whose links
+    were re-computed passes `verify_chain` but diverges here, because
+    the replay recomputes what the forged record merely claims.
+
+    Returns True when the replay verified, False when it DIVERGED (the
+    caller must serve no snapshot), and None when the verification
+    machinery is unavailable in this process (no program baseline, a
+    stored plan that does not hash to its recorded id, a worker that
+    cannot spawn): chain verification still ran on the same rows, and a
+    best-effort view must not go dark because an auxiliary check could
+    not run. Only a proven divergence withholds the snapshot.
+    """
+    import db
+    import tau_journal
+
+    entries = journal.entries()
+    if not entries:
+        return True
+    try:
+        import tau_allocator
+        import tau_authority
+        import tau_reconstruction
+        import tau_session
+
+        baseline = tau_authority.program_baseline()
+        if not baseline:
+            return None
+        plan = None
+        latest = db.latest_block_commit()
+        if latest is not None and latest.get("plan_json"):
+            plan = tau_reconstruction.RepresentationPlan.from_json(
+                latest["plan_json"])
+            if latest.get("plan_id") and plan.plan_id != latest["plan_id"]:
+                logger.warning(
+                    "active_rules: stored representation plan does not "
+                    "hash to its recorded id; replay check unavailable")
+                return None
+        if plan is None:
+            import tau_manager
+
+            with tau_manager.reexec_on_width_overflow():
+                plan = tau_reconstruction.plan_representation(
+                    history_rules=[
+                        e.rule_text for e in entries
+                        if e.kind == tau_journal.REVISION and e.rule_text
+                    ])
+        session = tau_session.WorkerSession.reconstruct(
+            baseline, journal=journal, plan=plan,
+            snapshot=tau_allocator.DbMappingSnapshot(), verify=True)
+        try:
+            return True
+        finally:
+            session.dispose()
+    except tau_journal.DivergenceError:
+        logger.warning(
+            "active_rules: rebuild replay DIVERGED from the committed "
+            "journal's recorded fingerprints; no snapshot", exc_info=True)
+        return False
+    except Exception:
+        logger.warning(
+            "active_rules: rebuild replay check unavailable in this "
+            "process; serving on chain verification alone", exc_info=True)
+        return None
+
+
 def _authority_spec_text() -> Optional[str]:
     """The running spec under worker-backed authority, from the journal.
 
@@ -168,8 +266,16 @@ def _authority_spec_text() -> Optional[str]:
                 # consumed it (the link chains the whole history, so an
                 # equal head means an equal journal).
                 return _mirror_iface.get_current_spec()
-            entries = tau_journal.journal_from_rows(
-                db.committed_journal_entries()).entries()
+            journal = tau_journal.journal_from_rows(
+                db.committed_journal_entries())
+            # Explicit chain verification over the rows just read, before
+            # the mirror is fed anything: a row whose content no longer
+            # hashes to its recorded link, or a chain whose links do not
+            # join up, must yield no snapshot rather than a spec that was
+            # never in force. The failure lands in the except path below
+            # (mirror poisoned, no text), like any mirror failure.
+            journal.verify_chain()
+            entries = journal.entries()
             reset_idx = tau_journal.last_reset_index(entries)
             reset_seq = entries[reset_idx].seq if reset_idx is not None \
                 else None
@@ -183,16 +289,17 @@ def _authority_spec_text() -> Optional[str]:
             )
             if rebuild:
                 iface = _new_mirror_iface()
-                start = 0
-                if reset_idx is not None:
-                    for text, _persist in entries[reset_idx].units:
-                        if text:
-                            _feed_mirror(iface, text)
-                    start = reset_idx + 1
-                for entry in entries[start:]:
-                    if entry.kind == tau_journal.REVISION \
-                            and entry.rule_text:
-                        _feed_mirror(iface, entry.rule_text)
+                _feed_from_scratch(iface, entries)
+                # A rebuild re-derives the mirror from the journal alone;
+                # before it may speak, the journal's recorded step
+                # fingerprints are verified by a full replay (the check
+                # a restart performs). A proven divergence poisons the
+                # mirror like any other failure; an unavailable check
+                # does not (see _rebuild_replay_check).
+                if _rebuild_replay_check(journal) is False:
+                    raise tau_journal.DivergenceError(
+                        "rebuild replay diverged from the committed "
+                        "journal's recorded fingerprints")
                 _mirror_iface = iface
                 _mirror_reset_seq = reset_seq
             else:
@@ -283,6 +390,115 @@ def resolve_snapshot(height: Optional[int] = None) -> Optional[Dict]:
     snap = db.get_spec_snapshot_at_or_before(int(height))
     if snap is not None:
         return snap
+    return db.get_earliest_spec_snapshot()
+
+
+def journal_cut_at_height(height: int) -> Optional[Dict]:
+    """The spec in force at `height`, derived from the committed journal.
+
+    The stored snapshots only exist for heights committed since the view
+    was introduced; the committed journal has always been there. The cut
+    is every committed entry up to the journal head the canonical block
+    at `height` committed (see `db.block_commit_at_height`), link-
+    verified over the cut and fed to a one-shot mirror. Returns a
+    snapshot-shaped dict marked ``derived == "journal_cut"`` (with the
+    block hash it answers for), or None when the cut cannot be derived:
+    no commit record for the height, a commit that names no journal
+    head, a journal head the journal no longer holds, a journal that
+    does not verify, or a mirror that cannot speak. Height 0 is the
+    empty cut: the program baseline before any committed entry.
+    """
+    import db
+    import tau_journal
+
+    try:
+        height = int(height)
+        if height == 0:
+            block_hash = db.get_genesis_hash() or None
+            if not block_hash:
+                return None
+            revision: Optional[int] = 0
+            cut_len = 0
+            commit = None
+        else:
+            commit = db.block_commit_at_height(height)
+            if commit is None:
+                return None
+            block_hash = commit["block_hash"]
+            revision = commit.get("spec_revision")
+            if revision is None:
+                # A commit that names a journal head but no revision
+                # cannot pin the cut to a spec_revision; not an answer.
+                return None
+            cut_len = -1  # resolved against the journal head below
+        journal = tau_journal.journal_from_rows(
+            db.committed_journal_entries())
+        entries = journal.entries()
+        if height > 0:
+            head_link = commit.get("journal_head")
+            if head_link is None:
+                return None
+            cut_len = None
+            for i, entry in enumerate(entries):
+                if entry.link == head_link:
+                    cut_len = i + 1
+            if cut_len is None:
+                return None
+        # Verify the cut itself, not the whole journal: the entries at
+        # or before the block's journal head are the record this answer
+        # rests on, and their chain must check out (a tamper after the
+        # height does not poison an earlier height's answer; a tamper
+        # inside the cut does).
+        tau_journal.verify_entries(entries[:cut_len])
+        iface = _new_mirror_iface()
+        _feed_from_scratch(iface, entries[:cut_len])
+        text = iface.get_current_spec()
+        if not text:
+            return None
+        return {
+            "spec_revision": revision,
+            "height": height,
+            "block_hash": block_hash,
+            "spec_hash": spec_hash_of(text),
+            "spec_text": text,
+            "derived": "journal_cut",
+        }
+    except Exception:
+        logger.warning(
+            "active_rules: journal cut at height %s unavailable", height,
+            exc_info=True)
+        return None
+
+
+def resolve_answer(height: Optional[int] = None) -> Optional[Dict]:
+    """The view a getactiverules query answers from, journal-cut aware.
+
+    Stored snapshots remain the fast path and the answer for every
+    height at or after the first snapshot. A height earlier than the
+    first snapshot -- or any height on a node whose database predates
+    the snapshots (written by pristine code) -- is answered from the
+    journal cut at that height instead of substituting the earliest
+    snapshot; the returned dict then carries ``derived`` so the source
+    is explicit in the answer. With no height and no snapshot at all,
+    the cut at the canonical tip answers. When neither a snapshot nor
+    a cut exists, None (the caller answers `available: false`).
+    """
+    import db
+
+    if height is None:
+        snap = db.get_latest_spec_snapshot()
+        if snap is not None:
+            return snap
+        tip = db.canonical_tip_height()
+        if tip is None:
+            return None
+        return journal_cut_at_height(tip)
+    snap = db.get_spec_snapshot_at_or_before(int(height))
+    if snap is not None:
+        return snap
+    cut = journal_cut_at_height(int(height))
+    if cut is not None:
+        return cut
     return db.get_earliest_spec_snapshot()
 
 
@@ -473,6 +689,13 @@ def survival_ledger(target: Optional[Dict] = None) -> List[Dict]:
         snap["spec_revision"]: set(spec_fragments(snap["spec_text"]))
         for snap in snapshots
     }
+    if target_revision not in frag_sets:
+        # A journal-cut target (journal_cut_at_height) has no stored
+        # snapshot; its own text is the target fragment set. Footprints
+        # still derive from the stored snapshot transitions, so a unit
+        # whose install interval has no stored snapshot reads as an
+        # empty footprint, exactly like an ACCEPTED_NOOP unit.
+        frag_sets[target_revision] = set(spec_fragments(target["spec_text"]))
     target_frags = frag_sets.get(target_revision, set())
 
     units = [

@@ -9,12 +9,15 @@ can leave claiming rules that are no longer in force.
 
 Without arguments: the latest snapshot (full effective spec text, its
 sha256, spec_revision, height). With a height: the newest snapshot at or
-before it; if every snapshot is later than the requested height, the
-earliest snapshot is returned and BOTH heights are in the answer, so the
-substitution is explicit. With an account: additionally the statements of
-the effective spec guarded by that account (`account_rules`) and the
-statements no single account can be attributed to (`unattributed`).
-Statements guarded by exactly one other account are omitted.
+before it; a height earlier than the first snapshot is answered from the
+committed journal cut at that height instead (the answer carries
+`derived: "journal_cut"` and the block hash it answers for); if neither
+a snapshot nor a cut exists for it, the earliest snapshot is returned
+and BOTH heights are in the answer, so the substitution is explicit.
+With an account: additionally the statements of the effective spec
+guarded by that account (`account_rules`) and the statements no single
+account can be attributed to (`unattributed`). Statements guarded by
+exactly one other account are omitted.
 
 Every answer with a snapshot also carries `survival_ledger`: one entry
 per confirmed rule unit in force at the snapshot's revision -- what its
@@ -65,7 +68,7 @@ def execute(raw_command: str, container):
         )
 
     try:
-        snapshot = active_rules.resolve_snapshot(height)
+        snapshot = active_rules.resolve_answer(height)
     except Exception as exc:
         logger.exception("Failed to resolve spec snapshot")
         return api_response.error_response(
@@ -87,6 +90,13 @@ def execute(raw_command: str, container):
         "spec_hash": snapshot["spec_hash"],
         "effective_spec": snapshot["spec_text"],
     })
+    if snapshot.get("derived"):
+        # The answer was derived from the committed journal cut at the
+        # requested height (no stored snapshot covers it); the source
+        # and the exact block are part of the answer, never silent.
+        data["derived"] = snapshot["derived"]
+    if snapshot.get("block_hash"):
+        data["block_hash"] = snapshot["block_hash"]
     try:
         data["survival_ledger"] = active_rules.survival_ledger(snapshot)
     except Exception as exc:

@@ -917,6 +917,82 @@ def latest_block_commit():
     return dict(zip(keys, row))
 
 
+def canonical_block_hash_at_height(height: int) -> Optional[str]:
+    """The canonical block hash at `height`, or None when the node does
+    not hold it (height beyond the tip, or no canonical chain yet)."""
+    height = int(height)
+    if height < 0:
+        return None
+    genesis = get_genesis_hash()
+    if not genesis:
+        return None
+    if height == 0:
+        return genesis
+    tip = current_tip()
+    if not tip:
+        return None
+    try:
+        path = get_chain_path(tip, genesis)
+    except Exception:
+        return None
+    if height > len(path):
+        return None
+    return path[height - 1]
+
+
+def canonical_tip_height() -> Optional[int]:
+    """The height of the canonical tip, or None when there is no chain."""
+    tip = current_tip()
+    genesis = get_genesis_hash()
+    if not tip or not genesis:
+        return None
+    if tip == genesis:
+        return 0
+    try:
+        return len(get_chain_path(tip, genesis))
+    except Exception:
+        return None
+
+
+def block_commit_at_height(height: int) -> Optional[Dict]:
+    """The commit record of the canonical block at `height`, or None.
+
+    The record is what pins a height to the committed journal: its
+    `journal_head` is the link of the last journal entry that block
+    committed, so the journal cut at the height is every entry up to
+    that link. The dict also carries the block's hash and timestamp.
+    Genesis (height 0) has no commit record and returns None, as does
+    any height the node does not hold.
+    """
+    block_hash = canonical_block_hash_at_height(height)
+    if not block_hash or int(height) == 0:
+        return None
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        cur = _db_conn.cursor()
+        cur.execute(
+            'SELECT execution_id, tip, parent, journal_head, allocator_digest, '
+            'plan_id, plan_json, spec_revision, time_point, committed_at '
+            'FROM block_commits_v1 WHERE tip = ? '
+            'ORDER BY committed_at DESC, rowid DESC LIMIT 1',
+            (block_hash,),
+        )
+        row = cur.fetchone()
+        cur.execute('SELECT timestamp FROM blocks WHERE block_hash = ?',
+                    (block_hash,))
+        ts = cur.fetchone()
+    if row is None:
+        return None
+    keys = ("execution_id", "tip", "parent", "journal_head",
+            "allocator_digest", "plan_id", "plan_json", "spec_revision",
+            "time_point", "committed_at")
+    out = dict(zip(keys, row))
+    out["block_hash"] = block_hash
+    out["block_timestamp"] = int(ts[0]) if ts else None
+    return out
+
+
 def current_tip():
     """The canonical head hash, or None. Named for the commit protocol."""
     return get_chain_state_value("canonical_head_hash", "") or None
