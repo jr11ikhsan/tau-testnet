@@ -262,10 +262,12 @@ class _RecipientNativeHarness:
     def _park(self, sender, to, amount, sk, **release):
         return self._park_full(sender, to, amount, sk, **release)[0]
 
-    def _park_full(self, sender, to, amount, sk, expire_blocks=50, **release):
+    def _park_full(self, sender, to, amount, sk, expire_blocks=50,
+                   seq_offset=0, **release):
         payload = cli_tx.build_retractable_transfer_tx(
             sender_pubkey=sender,
-            sequence_number=chain_state.get_sequence_number(sender),
+            sequence_number=(chain_state.get_sequence_number(sender)
+                             + seq_offset),
             expiration_time=int(time.time()) + 3600,
             expire_at_height=self._head() + expire_blocks,
             recipient_pubkey=to, amount=amount, fee_limit="1000", **release)
@@ -480,11 +482,13 @@ class TestNativeParksExpanded(_RecipientNativeHarness, unittest.TestCase):
 
     def test_cross_unit_giant_height_park_refused_as_blocks(self):
         """The failure mode of acknowledging a height park in seconds: a
-        near-maximum height park is refused AS a block park, carrying
-        the block cap and no seconds figure at all."""
+        height park far beyond the cap (but inside the generic
+        10,000-block params horizon, so the gate is what refuses it) is
+        refused AS a block park, carrying the block cap and no seconds
+        figure at all."""
         res = self._park_full(
-            SENDER, RECIPIENT, 100, SK_ALICE, expire_blocks=200000,
-            release_at_height=self._head() + 99999)[0]
+            SENDER, RECIPIENT, 100, SK_ALICE, expire_blocks=9000,
+            release_at_height=self._head() + 5000)[0]
         self.assertFalse(res["ok"], f"giant height park admitted: {res}")
         self.assertIn("RECIPIENT_MAX_HOLD", str(res))
         policy = res["details"]["recipient_policy"]
@@ -495,8 +499,10 @@ class TestNativeParksExpanded(_RecipientNativeHarness, unittest.TestCase):
         escrow_before = self._escrow_total()
         r1 = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
                         release_at_time=int(time.time()) + 540)
-        r2 = self._park(SENDER, RECIPIENT, 50, SK_ALICE,
-                        release_at_time=int(time.time()) + 540)
+        # Admission counts the still-queued first park, so the second
+        # park must carry the next sequence number already.
+        r2 = self._park_full(SENDER, RECIPIENT, 50, SK_ALICE, seq_offset=1,
+                             release_at_time=int(time.time()) + 540)[0]
         self.assertTrue(r1["ok"], r1)
         self.assertTrue(r2["ok"], r2)
         self._mine(expected_txs=2)
@@ -782,8 +788,14 @@ class TestNeutralAndExemptionsNative(_RecipientNativeHarness,
     def test_state_rebuild_replays_the_gate_verdicts_identically(self):
         """Replay determinism on one node: settle a transfer and a park,
         refuse a park, then rebuild the state from block 0 — balances,
-        sequences, escrow and head are exactly what they were."""
-        self._install_clause(RECIPIENT, CAP_BODY)
+        sequences, escrow and head are exactly what they were. The
+        clause is installed through a MINED deploy here (not the
+        registry shortcut the other classes use): the registry is
+        re-derived from block history during a rebuild, so only a
+        block-carried clause replays identically."""
+        res = self._deploy_rule(RECIPIENT, CAP_RULE, SK_BOB)
+        self.assertTrue(res["ok"], f"clause deploy refused: {res}")
+        self._mine(expected_txs=1)
         self._warm()
         self._transfer(SENDER, RECIPIENT, 101, SK_ALICE)
         res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
