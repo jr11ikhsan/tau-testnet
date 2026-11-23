@@ -793,6 +793,9 @@ class TestNeutralAndExemptionsNative(_RecipientNativeHarness,
         registry shortcut the other classes use): the registry is
         re-derived from block history during a rebuild, so only a
         block-carried clause replays identically."""
+        # Fund the recipient first (a pre-clause block, so it replays
+        # identically too): she needs a balance to pay the deploy fee.
+        self._transfer(SENDER, RECIPIENT, 1000, SK_ALICE)
         res = self._deploy_rule(RECIPIENT, CAP_RULE, SK_BOB)
         self.assertTrue(res["ok"], f"clause deploy refused: {res}")
         self._mine(expected_txs=1)
