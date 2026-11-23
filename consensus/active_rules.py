@@ -194,6 +194,7 @@ def _rebuild_replay_check(journal) -> Optional[bool]:
     """
     import db
     import tau_journal
+    import tau_session
 
     entries = journal.entries()
     if not entries:
@@ -202,7 +203,6 @@ def _rebuild_replay_check(journal) -> Optional[bool]:
         import tau_allocator
         import tau_authority
         import tau_reconstruction
-        import tau_session
 
         baseline = tau_authority.program_baseline()
         if not baseline:
@@ -238,6 +238,15 @@ def _rebuild_replay_check(journal) -> Optional[bool]:
             "active_rules: rebuild replay DIVERGED from the committed "
             "journal's recorded fingerprints; no snapshot", exc_info=True)
         return False
+    except tau_session.WorkerLost:
+        # The replay's worker died: the loss is translated here into the
+        # check's own vocabulary -- unavailable, like any other way the
+        # auxiliary check cannot run. The view falls back to the chain
+        # verification that already ran; the loss never propagates.
+        logger.warning(
+            "active_rules: rebuild replay check lost its worker; serving "
+            "on chain verification alone", exc_info=True)
+        return None
     except Exception:
         logger.warning(
             "active_rules: rebuild replay check unavailable in this "

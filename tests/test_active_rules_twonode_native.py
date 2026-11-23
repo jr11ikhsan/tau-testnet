@@ -274,21 +274,30 @@ def _run_child(role, workdir, restart=False):
     if restart:
         env["TWONODE_RESTART"] = "1"
     env["PYTHONPATH"] = str(_REPO) + os.pathsep + env.get("PYTHONPATH", "")
-    proc = subprocess.run(
-        [sys.executable, "-c", _CHILD_SRC % {"RULES": RULES}],
-        cwd=str(_REPO), env=env, capture_output=True, text=True,
-        timeout=1800)
+    # Child output goes to files, not pipes: if a child has to be killed
+    # at the timeout, worker grandchildren holding a pipe open must not
+    # be able to keep the parent blocked on pipe EOF.
+    tag = f"{role}{'-restart' if restart else ''}"
+    stdout_path = workdir / f"twonode_{tag}.stdout"
+    stderr_path = workdir / f"twonode_{tag}.stderr"
+    with open(stdout_path, "w") as out_fh, open(stderr_path, "w") as err_fh:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD_SRC % {"RULES": RULES}],
+            cwd=str(_REPO), env=env, stdout=out_fh, stderr=err_fh,
+            timeout=1800)
     out_name = f"twonode_{role}{'-restart' if restart else ''}.json"
     out_path = workdir / out_name
+    stdout = stdout_path.read_text(errors="replace")
+    stderr = stderr_path.read_text(errors="replace")
     assert out_path.exists(), (
         f"{role} child wrote no record; rc={proc.returncode}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        f"stdout:\n{stdout}\nstderr:\n{stderr}")
     record = json.loads(out_path.read_text())
     if record.get("skip"):
         pytest.skip(record["skip"])
     assert "error" not in record, (
         f"{role} child failed:\n{record.get('error')}\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        f"stdout:\n{stdout}\nstderr:\n{stderr}")
     return record
 
 

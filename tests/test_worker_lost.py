@@ -802,6 +802,11 @@ _OWNERS = {
     # AdmissionUnavailable at its own edge.
     os.path.join("commands", "getapprovalpreview.py"): "AdmissionUnavailable",
     os.path.join("commands", "sendtx.py"): "AdmissionUnavailable",
+    # The rules-in-force view's rebuild replay check owns a reconstruction
+    # session only for the duration of the check; a lost worker is
+    # translated there into "check unavailable" (the view serves on chain
+    # verification alone) and never propagates.
+    os.path.join("consensus", "active_rules.py"): "WorkerLost",
 }
 
 _SKIP_DIRS = {".git", ".claude", ".local", "venv", ".venv", "data", "tests",
