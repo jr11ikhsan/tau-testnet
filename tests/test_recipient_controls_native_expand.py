@@ -15,7 +15,9 @@ making the verdict —
        parks on both sides of it, cap 0 in both units, the block cap,
        cross-unit refusal (a height park is never measured in seconds),
        per-branch caps, retract never gated, release never re-checked,
-       replay determinism (state rebuild);
+       replay determinism (proven cross-node in the two-node file —
+       see the NOTE in TestNeutralAndExemptionsNative for why no
+       from-0 rebuild test lives in this harness);
   plus the surfaces around them: the CLI-composed clauses installed
   verbatim, the deploy screens (unit-blind, wrong width, pre-activation),
   the gate inert before activation, and registry tampering (the admission
@@ -785,49 +787,19 @@ class TestNeutralAndExemptionsNative(_RecipientNativeHarness,
             chain_state._balances.get(RECIPIENT, 0) - recip_before, 100)
         self.assertEqual(self._escrow_total(), escrow_before - 100)
 
-    def test_state_rebuild_replays_the_gate_verdicts_identically(self):
-        """Replay determinism on one node: settle a transfer and a park,
-        refuse a park, then rebuild the state from block 0 — balances,
-        sequences, escrow and head are exactly what they were. The
-        clause is installed through a MINED deploy here (not the
-        registry shortcut the other classes use): the registry is
-        re-derived from block history during a rebuild, so only a
-        block-carried clause replays identically."""
-        # Fund the recipient first (a pre-clause block, so it replays
-        # identically too): she needs a balance to pay the deploy fee.
-        self._transfer(SENDER, RECIPIENT, 1000, SK_ALICE)
-        res = self._deploy_rule(RECIPIENT, CAP_RULE, SK_BOB)
-        self.assertTrue(res["ok"], f"clause deploy refused: {res}")
-        self._mine(expected_txs=1)
-        self._warm()
-        self._transfer(SENDER, RECIPIENT, 101, SK_ALICE)
-        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
-                         release_at_time=int(time.time()) + 540)
-        self.assertTrue(res["ok"], res)
-        self._mine(expected_txs=1)
-        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
-                         release_at_time=int(time.time()) + 700)
-        self.assertFalse(res["ok"], res)
-        head_before = db.get_canonical_head_block()
-        snapshot = {
-            "balances": {a: chain_state._balances.get(a, 0)
-                         for a in (SENDER, RECIPIENT, STRANGER)},
-            "sequences": {a: chain_state.get_sequence_number(a)
-                          for a in (SENDER, RECIPIENT, STRANGER)},
-            "escrow": self._escrow_total(),
-        }
-        result = chain_state.rebuild_state_from_blockchain(0)
-        self.assertTrue(result.ok, result)
-        self.assertEqual(
-            db.get_canonical_head_block()["block_hash"],
-            head_before["block_hash"])
-        self.assertEqual(
-            {a: chain_state._balances.get(a, 0)
-             for a in (SENDER, RECIPIENT, STRANGER)}, snapshot["balances"])
-        self.assertEqual(
-            {a: chain_state.get_sequence_number(a)
-             for a in (SENDER, RECIPIENT, STRANGER)}, snapshot["sequences"])
-        self.assertEqual(self._escrow_total(), snapshot["escrow"])
+    # NOTE — no from-0 rebuild test in this file, deliberately: this
+    # harness funds SENDER/STRANGER by direct in-memory balance writes
+    # after genesis (see setUp), so the stored chain's first block is
+    # mined over state a from-0 rebuild can never reproduce (verified
+    # in fork CI: rebuild stops at block 1 with a state-hash mismatch
+    # even for a plain pre-clause funding transfer). From-0 rebuild
+    # determinism needs a genesis-funded subprocess harness — the
+    # pattern of tests/test_replay_determinism_native.py, which runs
+    # in the same CI. The gate's replay determinism IS covered in this
+    # package by the two-node activation+replay test in
+    # tests/test_recipient_controls_twonode_native.py: a follower
+    # replays the whole block stream (governance activation included)
+    # and reaches byte-identical checkpoints.
 
 
 @pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
