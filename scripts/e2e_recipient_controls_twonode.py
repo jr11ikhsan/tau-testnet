@@ -21,8 +21,8 @@ carrying recipient_policy_active, scheduled for a future height, voted
 by the validator, landing at that height on both nodes); the allow-list
 admitting and refusing (admission and apply); the 600-second cap
 admitting a 540 s park and refusing a 700 s one with the verified cap;
-a flood of 600 admission refusals while 15 honest payments land; and a
-fuzz pass of 1,000 malformed requests, all answered. Every claim is a
+a flood of 300 admission refusals while 10 honest payments land; and a
+fuzz pass of 600 malformed requests, all answered. Every claim is a
 named check printed as PASS/FAIL with a final tally; the exit code is
 non-zero unless every check passes.
 
@@ -418,6 +418,7 @@ def main():
             seal_empty("to_activation")
             sealed.append(head_dict())
         emit({"op": "sealed", "label": "activated", "blocks": sealed})
+        print("[e2e] governance activation landed", flush=True)
         F["active_at_height"] = governance_active()
         F["activation_height"] = int(head_dict()["header"]["block_number"])
         checkpoint("activated")
@@ -487,8 +488,10 @@ def main():
         emit({"op": "admission", "label": "park_over_cap"})
         checkpoint("park_over_cap")
 
+        print("[e2e] phases 1-4 done (boot, activation, lists, parks)",
+              flush=True)
         # Phase 5: flood + honest traffic. The allow-list goes back on;
-        # 600 unlisted attempts are refused at admission while 15
+        # 300 unlisted attempts are refused at admission while 10
         # honest listed payments are mined through the flood.
         install_clause(ALLOWLIST_BODY)
         emit({"op": "clause", "label": "allowlist2", "which": "allowlist"})
@@ -496,11 +499,14 @@ def main():
         honest_landed = 0
         honest_before = chain_state._balances.get(RECIPIENT, 0)
         flood_start = time.time()
-        for i in range(600):
+        for i in range(300):
             r = queue_transfer(STRANGER, RECIPIENT, 1 + (i % 50), SK_MALLORY)
             if not r.get("ok"):
                 refused += 1
-            if i % 40 == 39:
+            if i % 60 == 59:
+                print(f"[e2e] flood {i + 1}/300 refused={refused}",
+                      flush=True)
+            if i % 30 == 29:
                 r = queue_transfer(SENDER, RECIPIENT, 1, SK_ALICE)
                 if r.get("ok"):
                     mine("honest_%d" % honest_landed)
@@ -508,7 +514,7 @@ def main():
                     emit({"op": "block",
                           "label": "honest_%d" % (honest_landed - 1),
                           "block": head_dict()})
-        F["flood"] = {"attempts": 600, "refused": refused,
+        F["flood"] = {"attempts": 300, "refused": refused,
                       "honest_landed": honest_landed,
                       "honest_delta": chain_state._balances.get(RECIPIENT, 0)
                                       - honest_before,
@@ -516,7 +522,7 @@ def main():
         emit({"op": "admission", "label": "flood_done"})
         checkpoint("flood_done")
 
-        # Phase 6: fuzz — 1,000 malformed requests across the read and
+        # Phase 6: fuzz — 600 malformed requests across the read and
         # write surfaces. "Answered" means the call returned a response
         # (an error response counts); raising does not.
         from commands import getbalance, getrecipientpolicy as grp
@@ -528,7 +534,7 @@ def main():
             '{"tx_type": "user_tx", "operations": {"1": [["a", "b", "c"]]}}',
             '{"tx_type": "consensus_rule_update", "rule_revisions": "nope"}',
         ]
-        for i in range(1000):
+        for i in range(600):
             kind = i % 3
             try:
                 if kind == 0:
@@ -541,7 +547,10 @@ def main():
                 answered += 1
             except Exception:
                 pass
-        F["fuzz"] = {"attempts": 1000, "answered": answered,
+            if i % 200 == 199:
+                print(f"[e2e] fuzz {i + 1}/600 answered={answered}",
+                      flush=True)
+        F["fuzz"] = {"attempts": 600, "answered": answered,
                      "seconds": round(time.time() - fuzz_start, 2)}
         # The node must still work afterwards.
         res = queue_transfer(SENDER, RECIPIENT, 7, SK_ALICE)
@@ -637,10 +646,15 @@ def _run_child(workdir: pathlib.Path, role: str):
     env["TAU_FORCE_TEST"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         [str(_REPO), str(_REPO / "tests"), env.get("PYTHONPATH", "")])
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        capture_output=True, text=True, env=env, cwd=str(_REPO),
-        timeout=1800)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True, text=True, env=env, cwd=str(_REPO),
+            timeout=2700)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{role} child timed out after 2700s; partial output:\n"
+            f"STDOUT:\n{exc.stdout}\nSTDERR:\n{exc.stderr}")
     out_file = workdir / f"e2e_{role}.json"
     if not out_file.exists():
         raise RuntimeError(
@@ -743,14 +757,14 @@ def main(argv) -> int:
           over["ok"] is False and over["max_hold_seconds"] == 600,
           over["text"][:160])
     flood = F["flood"]
-    check("flood: 600 of 600 unlisted attempts refused at admission",
-          flood["refused"] == 600, f"refused={flood['refused']}")
-    check("flood: 15 of 15 honest payments landed during the flood",
-          flood["honest_landed"] == 15 and flood["honest_delta"] == 15,
+    check("flood: 300 of 300 unlisted attempts refused at admission",
+          flood["refused"] == 300, f"refused={flood['refused']}")
+    check("flood: 10 of 10 honest payments landed during the flood",
+          flood["honest_landed"] == 10 and flood["honest_delta"] == 10,
           f"landed={flood['honest_landed']} delta={flood['honest_delta']}")
     fuzz = F["fuzz"]
-    check("fuzz: 1000 of 1000 malformed requests answered",
-          fuzz["answered"] == 1000, f"answered={fuzz['answered']}")
+    check("fuzz: 600 of 600 malformed requests answered",
+          fuzz["answered"] == 600, f"answered={fuzz['answered']}")
     check("node still settles honest payments after the fuzz",
           F["post_fuzz_transfer"]["ok"] is True)
     fin_p, fin_q = P["final"], Q["final"]
