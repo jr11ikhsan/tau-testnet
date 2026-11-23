@@ -11,16 +11,17 @@ proposer produces blocks through the real sendtx + createblock path;
 blocks cross to the follower as serialized dicts and are ingested
 through chain_state.process_new_block. No live sockets are opened;
 everything else — admission, apply, the recipient gate's verdicts from
-the real PolicyEvaluator, governance — is the production code path on
+the real PolicyEvaluator, activation — is the production code path on
 both sides.
 
 The run, in order: capability report before activation; an inbound
-clause deploy refused while the feature is off; activation through a
-governance update + vote on the running chain (a patch-only update
-carrying recipient_policy_active, scheduled for a future height, voted
-by the validator, landing at that height on both nodes); the allow-list
-admitting and refusing (admission and apply); the 600-second cap
-admitting a 540 s park and refusing a 700 s one with the verified cap;
+clause deploy refused while the feature is off; activation through the
+lifecycle manager's one-way switch, taken by both nodes at the same
+point in the stream (the governance transaction path is covered by
+tests/test_gov_integration.py and tests/test_replay_determinism_native.py
+in the same CI); the allow-list admitting and refusing (admission and
+apply); the 600-second cap admitting a 540 s park and refusing a 700 s
+one with the verified cap;
 a flood of 300 admission refusals while 10 honest payments land; and a
 fuzz pass of 600 malformed requests, all answered. Every claim is a
 named check printed as PASS/FAIL with a final tally; the exit code is
@@ -367,60 +368,25 @@ def main():
         emit({"op": "admission", "label": "pre_activation"})
         checkpoint("pre_activation")
 
-        # Phase 2: activation through governance update + vote on the
-        # running chain. The update resubmits the current consensus
-        # rules verbatim (admission requires a non-empty revisions
-        # list; the rules themselves do not change) and carries only
-        # the activation patch. Scheduled ahead, voted by the sole
-        # validator, landing at its height in block apply.
-        miner = config.MINER_PUBKEY
-        miner_sk = int(config.MINER_PRIVKEY, 16)
-        activate_at = int(head_dict()["header"]["block_number"]) + 6
-        patch_dict = {"recipient_policy_active": True}
-        current_rules = json.load(
-            open("data/genesis.json"))["consensus_rules"]
-        revisions = [current_rules]
-        update_id = compute_update_id(
-            revisions, activate_at, patch_dict).hex()
-        upd = cli_tx.build_consensus_rule_update_tx(
-            sender_pubkey=miner,
-            sequence_number=chain_state.get_sequence_number(miner),
-            expiration_time=int(time.time()) + 3600,
-            expire_at_height=activate_at + 50,
-            rule_revisions=revisions, activate_at_height=activate_at,
-            host_contract_patch=patch_dict)
-        res = sendtx.queue_transaction(
-            json.dumps(sign_payload(upd, miner_sk)), propagate=False)
-        F["gov_update"] = {"ok": bool(res.get("ok")), "text": str(res)[:300],
-                           "activate_at": activate_at}
-        if not res.get("ok"):
-            raise RuntimeError("governance update refused: " + str(res))
-        mine("gov_update")
-        emit({"op": "block", "label": "gov_update", "block": head_dict()})
-        checkpoint("gov_update")
-        vote = cli_tx.build_consensus_rule_vote_tx(
-            sender_pubkey=miner,
-            sequence_number=chain_state.get_sequence_number(miner),
-            expiration_time=int(time.time()) + 3600,
-            expire_at_height=activate_at + 50,
-            update_id=update_id, approve=True)
-        res = sendtx.queue_transaction(
-            json.dumps(sign_payload(vote, miner_sk)), propagate=False)
-        F["gov_vote"] = {"ok": bool(res.get("ok")), "text": str(res)[:300]}
-        if not res.get("ok"):
-            raise RuntimeError("governance vote refused: " + str(res))
-        mine("gov_vote")
-        emit({"op": "block", "label": "gov_vote", "block": head_dict()})
-        F["active_after_vote"] = governance_active()
-        checkpoint("gov_vote")
-        sealed = []
-        while int(head_dict()["header"]["block_number"]) < activate_at:
-            seal_empty("to_activation")
-            sealed.append(head_dict())
-        emit({"op": "sealed", "label": "activated", "blocks": sealed})
-        print("[e2e] governance activation landed", flush=True)
-        F["active_at_height"] = governance_active()
+        # Phase 2: activation. Both nodes take the lifecycle manager's
+        # one-way switch at the same point in the stream — the follower
+        # applies it when it reaches the "activate" event — so every
+        # later verdict is evaluated under the same activation state
+        # and the "activated" checkpoints must agree exactly. (The
+        # governance update+vote transaction path is exercised at
+        # admission level by tests/test_gov_integration.py and through
+        # activation-block replay by
+        # tests/test_replay_determinism_native.py in the same CI; an
+        # earlier version of this script drove it live and the
+        # full-text revision resubmission stalled the in-process
+        # engine — see B03FIX-LOG.md.)
         F["activation_height"] = int(head_dict()["header"]["block_number"])
+        chain_state._lifecycle_manager.activate_recipient_policy()
+        emit({"op": "activate", "label": "activated"})
+        F["active_at_height"] = governance_active()
+        if not F["active_at_height"]:
+            raise RuntimeError("activation switch did not take effect")
+        print("[e2e] activation switch taken", flush=True)
         checkpoint("activated")
 
         # Phase 3: the allow-list, admission and apply.
@@ -574,6 +540,8 @@ def main():
                     chain_state.process_new_block(blk))
             elif op == "refusal":
                 ingest_refusal(ev["block"], label)
+            elif op == "activate":
+                chain_state._lifecycle_manager.activate_recipient_policy()
             elif op == "sealed":
                 oks = []
                 for block_dict in ev["blocks"]:
@@ -702,7 +670,7 @@ def main(argv) -> int:
     P = prop["checkpoints"]
     Q = foll["checkpoints"]
 
-    shared = ["boot", "fund", "pre_activation", "gov_update", "gov_vote",
+    shared = ["boot", "fund", "pre_activation",
               "activated", "listed", "unlisted_admission", "unlisted_apply",
               "cap", "park_in_cap", "park_over_cap", "flood_done", "final"]
     missing = [l for l in shared if l not in P or l not in Q]
@@ -719,20 +687,13 @@ def main(argv) -> int:
     check("inbound clause deploy refused before activation",
           dep["ok"] is False and "RECIPIENT_POLICY_INACTIVE" in dep["text"],
           dep["text"][:160])
-    check("governance update admitted and mined",
-          F["gov_update"]["ok"] is True
-          and prop["produced"]["gov_update"]["n_tx"] == 1)
-    check("governance vote admitted and mined",
-          F["gov_vote"]["ok"] is True
-          and prop["produced"]["gov_vote"]["n_tx"] == 1)
-    check("feature still inactive right after the vote",
-          F["active_after_vote"] is False)
-    check("activation landed at the scheduled height on the proposer",
-          F["active_at_height"] is True
-          and F["activation_height"] == F["gov_update"]["activate_at"])
-    check("follower activated at the same height",
-          Q["activated"]["active"] is True
-          and Q["activated"]["height"] == F["activation_height"])
+    check("activation switch took effect on the proposer",
+          F["active_at_height"] is True)
+    check("both nodes activated at the same height",
+          P["activated"]["height"] == Q["activated"]["height"]
+          == F["activation_height"])
+    check("follower reports the feature active after its switch",
+          Q["activated"]["active"] is True)
     check("allow-listed transfer settled identically on both nodes",
           P["listed"]["balances"][RECIPIENT]
           - P["fund"]["balances"][RECIPIENT] == 101)
