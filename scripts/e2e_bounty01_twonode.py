@@ -44,9 +44,11 @@ miner identity exactly as the native suites boot), three phases:
   phase-2 checkpoint — replay from block 0 plus a restart lands on
   the identical root (scenario d).
 
-The scenario funding (100,000 / 1,000) is folded into the genesis
-account mirrors every boot, fresh or restart, so a replay from
-block 0 starts from the identical funded genesis on every node —
+The scenario funding (payer 100,000; recipient and executor 1,000
+each — the recipient's route-install transaction pays its own
+admission fee) is folded into the genesis account mirrors every
+boot, fresh or restart, so a replay from block 0 starts from the
+identical funded genesis on every node —
 the replay-determinism harness's own device. Blocks are hand-built
 after the timeline leaves the wall clock, with the miner's own
 header computation (a dry-run of engine.apply_block, the resulting
@@ -220,10 +222,13 @@ def main():
         db.clear_mempool()
         # Scenario funding, folded into the genesis account mirrors as
         # well, so a replay from block 0 on any later boot starts from
-        # the identical funded genesis.
+        # the identical funded genesis. The recipient is funded too:
+        # his route-install transaction pays its own admission fee.
         chain_state._balances[PAYER] = 100000
+        chain_state._balances[RECIPIENT] = 1000
         chain_state._balances[EXECUTOR] = 1000
         chain_state._genesis_accounts_state[PAYER] = 100000
+        chain_state._genesis_accounts_state[RECIPIENT] = 1000
         chain_state._genesis_accounts_state[EXECUTOR] = 1000
         chain_state._lifecycle_manager.active_validators = set(
             chain_state._genesis_active_validators)
@@ -248,6 +253,7 @@ def main():
         db.init_db()
         chain_state.load_genesis("data/genesis.json")
         chain_state._genesis_accounts_state[PAYER] = 100000
+        chain_state._genesis_accounts_state[RECIPIENT] = 1000
         chain_state._genesis_accounts_state[EXECUTOR] = 1000
         tau_manager.tau_direct_interface = iface
         tau_manager.tau_ready.set()
