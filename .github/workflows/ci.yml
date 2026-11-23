@@ -117,6 +117,21 @@ jobs:
           mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
           python -m pytest
           tests/test_recipient_controls_native.py
+          tests/test_recipient_controls_native_expand.py
           tests/test_recipient_controls_twonode_native.py
           -p no:asyncio -v
+          "
+
+      # FIX B03-2: the standalone two-node e2e script (governance
+      # activation on the running chain, allow-list + cap, flood + fuzz)
+      # runs in its own docker run for the same clean-interpreter reason.
+      - name: Run Bounty 03 two-node e2e script
+        run: >
+          docker run --rm -e TAU_FORCE_TEST=0 -w /app/tau-testnet tau-node:ci
+          sh -c "
+          python scripts/generate_miner_keys.py &&
+          python scripts/gen_genesis.py --validator-privkey \"\$(cat test_miner.key)\" --out data/genesis.json &&
+          mv test_miner.key test_miner.pub data/ &&
+          mkdir -p data_local && cp data/test_miner.key data/test_miner.pub data_local/ &&
+          python scripts/e2e_recipient_controls_twonode.py run
           "

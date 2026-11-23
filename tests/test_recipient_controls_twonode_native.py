@@ -199,7 +199,8 @@ def main():
     chain_state._balances[STRANGER] = 100000
     chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY.lower()}
     chain_state._lifecycle_manager.recompute_approval_threshold()
-    chain_state._lifecycle_manager.activate_recipient_policy()
+    if os.environ.get("TWONODE_ACT_AT_BOOT", "1") == "1":
+        chain_state._lifecycle_manager.activate_recipient_policy()
     tau_manager.tau_direct_interface = iface
     tau_manager.tau_ready.set()
 
@@ -401,12 +402,29 @@ def main():
         return candidate
 
     install_clause(ALLOWLIST_BODY)
+    checkpoint("boot")
 
     if ROLE == "proposer":
         events = []
 
         def emit(ev):
             events.append(ev)
+
+        if os.environ.get("TWONODE_VARIANT") == "activation":
+            # Activation variant (FIX B03-1): the clause is installed but
+            # the feature is still off — an unlisted payer's transfer
+            # settles on both nodes, because the gate is inert. Both
+            # nodes then take the one-way activation at the same point
+            # (the governance outcome both adopt), and the standard
+            # scenario below runs with the gate live.
+            mine_transfer("inert_settle", STRANGER, RECIPIENT, 100,
+                          SK_MALLORY)
+            emit({"op": "block", "label": "inert_settle",
+                  "block": head_dict()})
+            checkpoint("inert_settle")
+            chain_state._lifecycle_manager.activate_recipient_policy()
+            emit({"op": "activate", "label": "activated"})
+            checkpoint("activated")
 
         # Warm-up + case (a): allowlisted transfers settle.
         mine_transfer("warmup", SENDER, RECIPIENT, 1, SK_ALICE)
@@ -504,6 +522,20 @@ def main():
         emit({"op": "block", "label": "d_final", "block": head_dict()})
         checkpoint("d_final")
 
+        if os.environ.get("TWONODE_VARIANT") == "activation":
+            # Replay (FIX B03-1): the identical refusal candidate and
+            # the identical final block are ingested a second time on
+            # both nodes. A replay must be a no-op — refused as already
+            # known, state untouched — never a second settlement or a
+            # second refusal-with-effects.
+            result["ingest"]["replay_c_apply"] = bool(
+                chain_state.process_new_block(candidate))
+            result["ingest"]["replay_d_final"] = bool(
+                chain_state.process_new_block(Block.from_dict(head_dict())))
+            emit({"op": "replay", "label": "replay",
+                  "block": candidate.to_dict(), "also": head_dict()})
+            checkpoint("replay")
+
         with open(EVENTS_PATH, "w") as fh:
             json.dump({"events": events}, fh, indent=1, sort_keys=True,
                       default=str)
@@ -521,6 +553,13 @@ def main():
             elif op == "clause":
                 install_clause(CAP_BODY if ev["which"] == "cap"
                                else TIGHT_CAP_BODY)
+            elif op == "activate":
+                chain_state._lifecycle_manager.activate_recipient_policy()
+            elif op == "replay":
+                result["ingest"]["replay_c_apply"] = bool(
+                    chain_state.process_new_block(Block.from_dict(ev["block"])))
+                result["ingest"]["replay_d_final"] = bool(
+                    chain_state.process_new_block(Block.from_dict(ev["also"])))
             elif op == "admission":
                 pass  # admission is proposer-side; the checkpoint records
                       # this node's untouched state at the same point.
@@ -546,7 +585,7 @@ def _child_src() -> str:
     }
 
 
-def _run_child(tmp_path, role):
+def _run_child(tmp_path, role, variant=None):
     script = tmp_path / f"twonode_child_{role}.py"
     script.write_text(_child_src())
     env = dict(os.environ)
@@ -554,6 +593,9 @@ def _run_child(tmp_path, role):
     env["TWONODE_REPO"] = str(_REPO)
     env["TWONODE_WORKDIR"] = str(tmp_path)
     env["TAU_FORCE_TEST"] = "0"
+    if variant == "activation":
+        env["TWONODE_VARIANT"] = "activation"
+        env["TWONODE_ACT_AT_BOOT"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(
         [str(_REPO), str(_REPO / "tests"), env.get("PYTHONPATH", "")])
     proc = subprocess.run(
@@ -672,3 +714,70 @@ def test_recipient_controls_two_node_parity(tmp_path):
     assert cp["d_final"]["height"] == 6, cp["d_final"]
     assert cp["d_final"]["policy_view"]["evaluation"][
         "max_hold_seconds"] == 300
+
+
+def test_recipient_controls_two_node_activation_and_replay(tmp_path):
+    """FIX B03-1, the two scenarios the parity run above does not cover:
+    activation mid-chain, and replay.
+
+    Both nodes boot with the allow-list installed but recipient controls
+    INACTIVE: an unlisted payer's transfer settles on both (the gate is
+    inert — the pre-activation case, proven across two nodes, not one).
+    Both nodes then take the one-way activation at the same height and
+    the whole standard scenario (settle / refuse / tighten / refuse)
+    replays with the gate live, ending in identical checkpoints. Finally
+    the identical refusal candidate and the identical final block are
+    ingested a second time on both nodes: a replay is refused as already
+    known and the state afterwards is the state before, exactly."""
+    proc_p, prop = _run_child(tmp_path, "proposer", variant="activation")
+    _assert_child_ok(proc_p, prop, "proposer")
+    proc_f, foll = _run_child(tmp_path, "follower", variant="activation")
+    _assert_child_ok(proc_f, foll, "follower")
+
+    for label, ok in sorted(foll["ingest"].items()):
+        if label.startswith("replay"):
+            continue  # replay ingestions are asserted False below
+        assert ok, f"follower failed to ingest {label}"
+    for label, ok in sorted(prop["ingest"].items()):
+        if label.startswith("replay"):
+            continue
+        assert ok, f"proposer failed to ingest {label}"
+
+    assert prop["checkpoints"].keys() == foll["checkpoints"].keys()
+    for label in prop["checkpoints"]:
+        assert prop["checkpoints"][label] == foll["checkpoints"][label], (
+            f"checkpoint {label} diverges:\nproposer={prop['checkpoints'][label]}"
+            f"\nfollower={foll['checkpoints'][label]}")
+
+    cp = prop["checkpoints"]
+
+    # Inert before activation: the unlisted payer's 100 settled on both
+    # nodes (the checkpoint streams are equal), and the policy view was
+    # not yet reportable (the RPC refuses while the feature is off).
+    assert prop["produced"]["inert_settle"]["n_tx"] == 1
+    delta = (cp["inert_settle"]["balances"][RECIPIENT]
+             - cp["boot"]["balances"][RECIPIENT])
+    assert delta == 100, f"pre-activation transfer settled {delta}, not 100"
+    assert cp["boot"]["policy_view"] is None
+    assert cp["inert_settle"]["policy_view"] is None
+    # Activation itself moves nothing.
+    assert cp["activated"]["balances"] == cp["inert_settle"]["balances"]
+    assert cp["activated"]["height"] == cp["inert_settle"]["height"]
+
+    # With the gate live, the standard claims hold again in this run:
+    # the listed 101 settles, the tightened cap reads back as 300.
+    delta = (cp["a_settled"]["balances"][RECIPIENT]
+             - cp["warmup"]["balances"][RECIPIENT])
+    assert delta == 101, f"allowlisted transfer settled {delta}, not 101"
+    assert cp["d_final"]["policy_view"]["evaluation"][
+        "max_hold_seconds"] == 300
+    # One extra block vs the parity run: the pre-activation settlement.
+    assert cp["d_final"]["height"] == 7, cp["d_final"]
+
+    # Replay: the second ingestion of the identical blocks is refused
+    # as already known on BOTH nodes, and the state after the replay is
+    # the state before it — every checkpoint field identical.
+    for record in (prop, foll):
+        assert record["ingest"]["replay_c_apply"] is False, record["ingest"]
+        assert record["ingest"]["replay_d_final"] is False, record["ingest"]
+    assert cp["replay"] == cp["d_final"]

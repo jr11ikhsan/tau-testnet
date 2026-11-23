@@ -226,6 +226,44 @@
                         </div>
                         <div id="rule-validation-status" class="form-text mt-1"></div>
                     </div>
+                    <div class="mb-3 border-top pt-3">
+                        <label class="form-label">Rule for incoming payments (recipient controls, issues #47/#76)</label>
+                        <div class="form-text mb-2">
+                            Build the o5 rule that judges payments <em>to you</em>: who may pay you, and how
+                            long a payment to you may stay parked. The composed text is identical to the
+                            node's <code>policy receive</code> CLI output for the same choices. It takes
+                            effect only on a chain where recipient controls are active — building the rule
+                            asks the node first and warns you here if they are not.
+                        </div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-md-4">
+                                <label for="recv-mode" class="form-label">Kind</label>
+                                <select class="form-select" id="recv-mode">
+                                    <option value="combined" selected>Allow-list + max hold</option>
+                                    <option value="allowlist">Allow-list only</option>
+                                    <option value="maxhold">Max hold only</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label for="recv-seconds" class="form-label">Max hold (seconds)</label>
+                                <input type="number" class="form-control" id="recv-seconds" min="0"
+                                    placeholder="e.g. 600 — blank = no cap">
+                            </div>
+                            <div class="col-md-4">
+                                <label for="recv-blocks" class="form-label">Max hold (blocks)</label>
+                                <input type="number" class="form-control" id="recv-blocks" min="0"
+                                    placeholder="e.g. 100 — blank = no cap">
+                            </div>
+                        </div>
+                        <div class="mb-2">
+                            <label for="recv-senders" class="form-label">Accepted senders (pubkeys, one per line)</label>
+                            <textarea class="form-control" id="recv-senders" rows="2"
+                                placeholder="96-hex-character pubkey of each payer you accept"></textarea>
+                        </div>
+                        <button class="btn btn-sm btn-outline-primary" type="button" id="btn-recv-build">Build
+                            incoming-payments rule</button>
+                        <div id="recv-status" class="form-text mt-1"></div>
+                    </div>
                 </div>
 
                 <!-- Custom Ops Tab -->

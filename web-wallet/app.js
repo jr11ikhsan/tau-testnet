@@ -3589,3 +3589,171 @@ window.addEventListener('load', () => {
         });
     }
 });
+
+// --- Recipient controls (issues #47/#76): "Rule for incoming payments" ------
+// The inbound counterpart of the CLI's `policy receive` composers
+// (tau_testnet_cli/cli.py: compose_allowlist_clause / compose_max_hold_clause
+// / compose_combined_clause). Composition is pure text — the same canonical
+// annotated shapes the node's deploy screens and cap extractor read — so the
+// clause built here is byte-for-byte the clause the CLI prints for the same
+// inputs (pinned by tests/test_web_wallet_recipient_policy.py). Stream
+// contract: i17 is the hold in its native unit, i16 is the context tag
+// (0 outgoing, 1 final, 2 time park in seconds, 3 height park in blocks);
+// every composed clause reads i16, so none of them is unit-blind.
+
+function recipientBv64Hex(value) {
+    let digits = Number(value).toString(16);
+    if (digits.length % 2) digits = '0' + digits;
+    return digits.padStart(4, '0');
+}
+
+function recipientCtxIs(context) {
+    return 'i16[t]:bv[64] = { #x' + recipientBv64Hex(context) + ' }:bv[64]';
+}
+
+function recipientSenderIs(pubkey) {
+    return 'i3[t]:bv[384] = { #x' + pubkey + ' }:bv[384]';
+}
+
+function recipientCheckedPubkeys(values) {
+    const out = [];
+    for (const value of values || []) {
+        const text = String(value).trim().toLowerCase();
+        if (!/^[0-9a-f]{96}$/.test(text)) {
+            throw new Error('sender pubkey must be a 96-hex-character pubkey, got ' + JSON.stringify(value));
+        }
+        out.push(text);
+    }
+    if (!out.length) throw new Error('at least one sender pubkey is required');
+    return out;
+}
+
+function recipientCheckedCap(value, flag) {
+    if (value === null || value === undefined) return null;
+    if (!Number.isInteger(value) || value < 0) {
+        throw new Error(flag + ' must be 0 or more, got ' + value);
+    }
+    return value;
+}
+
+function composeRecipientAllowlistClause(senders) {
+    const allow = '(o5[t]:bv[24] = { #x000001 }:bv[24])';
+    const block = '(o5[t]:bv[24] = { #x000000 }:bv[24])';
+    const listed = recipientCheckedPubkeys(senders).map(recipientSenderIs).join(' || ');
+    const cond = '(' + recipientCtxIs(0) + ' || ' + listed + ')';
+    return 'always ( ' + cond + ' ? ' + allow + ' : ' + block + ' ).';
+}
+
+function composeRecipientMaxHoldClause(seconds, blocks) {
+    const allow = '(o5[t]:bv[24] = { #x000001 }:bv[24])';
+    const block = '(o5[t]:bv[24] = { #x000000 }:bv[24])';
+    const sec = recipientCheckedCap(seconds, '--seconds');
+    const blk = recipientCheckedCap(blocks, '--blocks');
+    const terms = [];
+    if (sec !== null) {
+        terms.push('(' + recipientCtxIs(2) + ' && i17[t]:bv[64] > { #x' + recipientBv64Hex(sec) + ' }:bv[64])');
+    }
+    if (blk !== null) {
+        terms.push('(' + recipientCtxIs(3) + ' && i17[t]:bv[64] > { #x' + recipientBv64Hex(blk) + ' }:bv[64])');
+    }
+    if (!terms.length) {
+        throw new Error('give at least one cap: seconds and/or blocks');
+    }
+    let cond = terms.join(' || ');
+    if (terms.length > 1) cond = '(' + cond + ')';
+    return 'always ( ' + cond + ' ? ' + block + ' : ' + allow + ' ).';
+}
+
+function composeRecipientCombinedClause(senders, seconds, blocks) {
+    const allow = '(o5[t]:bv[24] = { #x000001 }:bv[24])';
+    const block = '(o5[t]:bv[24] = { #x000000 }:bv[24])';
+    const sec = recipientCheckedCap(seconds, '--seconds');
+    const blk = recipientCheckedCap(blocks, '--blocks');
+    const listed = recipientCheckedPubkeys(senders).map(recipientSenderIs).join(' || ');
+    const fits = (context, cap) => cap === null
+        ? '(' + recipientCtxIs(context) + ')'
+        : '(' + recipientCtxIs(context) + ' && i17[t]:bv[64] <= { #x' + recipientBv64Hex(cap) + ' }:bv[64])';
+    const cond = '((' + recipientCtxIs(0) + ' || ' + listed + ') && ('
+        + recipientCtxIs(0) + ' || ' + recipientCtxIs(1) + ' || '
+        + fits(2, sec) + ' || ' + fits(3, blk) + '))';
+    return 'always ( ' + cond + ' ? ' + allow + ' : ' + block + ' ).';
+}
+
+function explainRecipientRefusal(code) {
+    switch (code) {
+        case 'RECIPIENT_MAX_HOLD':
+            return 'The recipient\'s rule caps how long a payment to them may be parked. '
+                + 'Release the payment sooner (a shorter hold), or ask the recipient to raise their cap.';
+        case 'RECIPIENT_POLICY':
+        case 'recipient_policy_block':
+            return 'The recipient\'s incoming-payments rule refused this payment. '
+                + 'Only the recipient can change that rule — ask them to allow your address, or pay a different address.';
+        case 'RECIPIENT_POLICY_INACTIVE':
+            return 'Recipient controls are not active on this chain yet, so an incoming-payments rule cannot '
+                + 'take effect. Activation is a one-way governance patch (recipient_policy_active) — until it '
+                + 'lands, payments are judged exactly as before.';
+        default:
+            return '';
+    }
+}
+
+// Builder wiring: compose from the form, drop the clause into the rule
+// editor (the wallet's normal send flow installs it as the account's o5
+// rule), and ask the node for its governance state before anything is
+// signed — an inactive chain is reported with the actionable sentence
+// above instead of letting the deploy fail blind.
+function buildRecipientRule() {
+    const status = document.getElementById('recv-status');
+    const setStatus = (text, isError) => {
+        if (status) {
+            status.textContent = text;
+            status.style.color = isError ? '#c0392b' : '';
+        }
+    };
+    try {
+        const mode = document.getElementById('recv-mode').value;
+        const senders = document.getElementById('recv-senders').value
+            .split(/[\s,]+/).filter(Boolean);
+        const secRaw = document.getElementById('recv-seconds').value.trim();
+        const blkRaw = document.getElementById('recv-blocks').value.trim();
+        const seconds = secRaw === '' ? null : Number(secRaw);
+        const blocks = blkRaw === '' ? null : Number(blkRaw);
+        let clause;
+        if (mode === 'allowlist') {
+            clause = composeRecipientAllowlistClause(senders);
+        } else if (mode === 'maxhold') {
+            clause = composeRecipientMaxHoldClause(seconds, blocks);
+        } else {
+            clause = composeRecipientCombinedClause(senders, seconds, blocks);
+        }
+        const ruleArea = document.getElementById('tx-rule');
+        if (ruleArea) {
+            ruleArea.value = clause;
+            ruleArea.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        setStatus('Rule composed and placed in the rule editor — review it, then send as your rule. '
+            + 'Checking the chain\'s recipient-controls state…', false);
+        const onGov = (e) => {
+            const data = e.detail || {};
+            if (data.error) {
+                setStatus('Rule composed. The node did not answer getgovernance (' + data.error
+                    + '), so the activation state is unknown — the rule only takes effect on a chain '
+                    + 'where recipient controls are active.', false);
+            } else if (data.recipient_policy_active === true) {
+                setStatus('Rule composed and placed in the rule editor. Recipient controls are ACTIVE '
+                    + 'on this chain — the rule takes effect once installed.', false);
+            } else {
+                setStatus('Rule composed, but: ' + explainRecipientRefusal('RECIPIENT_POLICY_INACTIVE'), true);
+            }
+        };
+        window.addEventListener('govStatusResponse', onGov, { once: true });
+        sendRpc('getgovernance');
+    } catch (err) {
+        setStatus('Could not compose the rule: ' + err.message, true);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('btn-recv-build');
+    if (btn) btn.addEventListener('click', buildRecipientRule);
+});
