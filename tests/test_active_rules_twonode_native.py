@@ -13,9 +13,9 @@ the standard import path. No live sockets are opened; everything else
 -- admission, apply, the journal, the commits -- is production code on
 both sides.
 
-Scenario: the named resend case plus one o5-only unit -- A
-(o26 = {7} && o27 = {9}), B (o26 = {3}), A again, then an o5-only
-rule -- one block each. Asserted on BOTH nodes, per height:
+Scenario: the named resend case plus one unrelated unit -- A
+(o26 = {7} && o27 = {9}), B (o26 = {3}), A again, then a constant
+rule over o28 -- one block each. Asserted on BOTH nodes, per height:
 
   * the getactiverules answer (spec hash + revision) from the stored
     snapshots agrees;
@@ -59,8 +59,12 @@ _REPO = pathlib.Path(__file__).resolve().parent.parent
 RULE_A = ("always ( o26[t]:bv[24] = { 7 }:bv[24] && "
           "o27[t]:bv[24] = { 9 }:bv[24] ).")
 RULE_B = "always ( o26[t]:bv[24] = { 3 }:bv[24] )."
-RULE_O5 = "always ( o5[t]:bv[24] = { 1 }:bv[24] )."
-RULES = [RULE_A, RULE_B, RULE_A, RULE_O5]
+# A fourth unit over an unrelated stream, so the scenario also crosses
+# a block the A/B/A assertions do not read. (An o5-only unit cannot be
+# the fourth: admission routes a rule that only defines o5 as a clause
+# declaration and refuses it for reading no input stream.)
+RULE_D = "always ( o28[t]:bv[24] = { 42 }:bv[24] )."
+RULES = [RULE_A, RULE_B, RULE_A, RULE_D]
 
 _CHILD_SRC = r'''
 import hashlib
@@ -349,12 +353,15 @@ def test_rules_view_agrees_across_two_nodes(tmp_path):
         restarted["receipts"]
     # The scenario's four units were recorded as revisions, in order
     # (the resend of A included -- no deduplication), and the commits'
-    # spec_revision advanced once per block.
+    # spec_revision advanced by exactly one per block (genesis commits
+    # its own rules first, so the absolute values start above 4).
     texts = proposer["receipts"]["revision_texts"]
     stream = iter(texts)
     assert all(any(t == want for t in stream) for want in RULES), texts
-    assert proposer["receipts"]["commit_revisions"] == {
-        str(h): h for h in range(1, len(RULES) + 1)}
+    revs = [proposer["receipts"]["commit_revisions"][str(h)]
+            for h in range(1, len(RULES) + 1)]
+    assert all(r is not None for r in revs), revs
+    assert all(b == a + 1 for a, b in zip(revs, revs[1:])), revs
 
     # Journal-cut answers agree across both nodes AND the restarted
     # follower, and run the first unit's terms at block 3.
