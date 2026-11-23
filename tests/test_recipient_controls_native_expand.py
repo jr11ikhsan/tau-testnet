@@ -923,5 +923,240 @@ class TestRegistryTamperNative(_RecipientNativeHarness, unittest.TestCase):
         self.assertEqual(db.get_mempool_txs(), [])
 
 
+# --- B03FIX2: hold-cap semantics a competitor refined, pinned natively ---
+#
+# PR #166 (AduAkorful) spent four commits on the exactness of hold-cap
+# reporting: a seconds cap must refuse a height park however large the
+# literal, a cap must stay exact when the clause also names a time lock,
+# a cap may be named only from change points the judged payment itself
+# fixes, and a forged stream key must never reach the clause. Our design
+# reaches the same semantics by different machinery (the hold is judged
+# in its native unit behind an i16 context tag; caps are verified as a
+# single threshold across the branch's change points) — these tests pin
+# each semantic BY NAME on the real engine.
+
+# Seconds cap of one year (31,536,000 — past the 90-day release window)
+# and a blocks cap of 0.
+PAST_WINDOW_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x1E13380 }:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0000 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+# CAP_BODY with a bv[64] time-lock literal (i5) conjoined in the seconds
+# branch: the hold cap must still be named exactly.
+TIMELOCK_CAP_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > { #x0258 }:bv[64] && "
+    "i5[t]:bv[64] > { #x0064 }:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+# Admits 0..101 and 5000..6000 seconds, refuses between and above.
+HOLED_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] <= { #x0065 }:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] >= { #x1388 }:bv[64] && "
+    "i17[t]:bv[64] <= { #x1770 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) : (o5[t]:bv[24] = { #x000000 }:bv[24])"
+)
+
+# The seconds branch caps the hold at the payment amount (i1) — a change
+# point this payment itself fixes, with no literal anywhere.
+STREAM_CAP_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > i1[t]:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+# The seconds branch caps the hold at i9, a stream this payment's input
+# map does not carry: the change point is not this payment's to name.
+UNFIXED_STREAM_BODY = (
+    "((i16[t]:bv[64] = { #x0002 }:bv[64] && i17[t]:bv[64] > i9[t]:bv[64]) || "
+    "(i16[t]:bv[64] = { #x0003 }:bv[64] && i17[t]:bv[64] > { #x0064 }:bv[64])) "
+    "? (o5[t]:bv[24] = { #x000000 }:bv[24]) : (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+class TestGetgovernanceScheduledPatch(unittest.TestCase):
+    """The getgovernance deadlock class, found by this parity test: for
+    a scheduled update carrying an activation flag patch, the advisory
+    precheck audits the tip's effective spec texts, whose chain_state
+    getters take _rules_lock — while getgovernance already held that
+    (non-re-entrant) lock, plus the balance and sequence locks. The
+    read hung forever exactly during a flag-activation window. The fix
+    defers the prechecks until after the state locks are released.
+    Pure Python: runs in every job, not only the native one."""
+
+    def test_getgovernance_answers_with_a_scheduled_flag_patch(self):
+        import threading
+        import types
+
+        from commands import getgovernance
+        from consensus.governance import (
+            ConsensusLifecycleManager,
+            ConsensusRuleUpdate,
+        )
+
+        lm = ConsensusLifecycleManager(active_validators=["aa" * 48])
+        # Both activation flags take the precheck through the collision
+        # audit over the tip's effective spec texts — the read that used
+        # to re-take the rules lock. One scheduled update per flag.
+        updates = []
+        for height, key in ((12, "recipient_policy_active"),
+                            (13, "approval_slots_active")):
+            update = ConsensusRuleUpdate(
+                rule_revisions=[], activate_at_height=height,
+                host_contract_patch={key: True})
+            lm.scheduled_updates.append((height, update.update_id))
+            lm.update_payloads[update.update_id] = update
+            updates.append(update)
+
+        class _DB:
+            def get_canonical_head_block(self):
+                return {"block_hash": "ab" * 32,
+                        "header": {"block_number": 7}}
+
+            def get_mempool_txs(self):
+                return []
+
+        stub_chain_state = types.SimpleNamespace(
+            _balance_lock=chain_state._balance_lock,
+            _sequence_lock=chain_state._sequence_lock,
+            _rules_lock=chain_state._rules_lock,
+            _lifecycle_manager=lm,
+            _active_consensus_id=None,
+            _consensus_rules_state="",
+            _application_rules_state="",
+        )
+        container = types.SimpleNamespace(
+            chain_state=stub_chain_state, db=_DB())
+        out = {}
+
+        def run():
+            out["resp"] = getgovernance.execute("getgovernance", container)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(
+            thread.is_alive(),
+            "getgovernance stalled on a scheduled flag patch")
+        resp = json.loads(out["resp"])
+        self.assertEqual(resp["status"], "ok", resp)
+        scheduled = resp["data"]["scheduled_updates"]
+        self.assertEqual(len(scheduled), 2, resp)
+        by_patch = {
+            next(iter(e["host_contract_patch"])): e for e in scheduled
+        }
+        for key in ("recipient_policy_active", "approval_slots_active"):
+            self.assertEqual(by_patch[key]["precheck"], "ok", resp)
+            self.assertEqual(
+                by_patch[key]["host_contract_patch"], {key: True}, resp)
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestHoldCapChangePointsNative(_RecipientNativeHarness,
+                                    unittest.TestCase):
+    """B03FIX2 on the real engine: cross-unit caps, time-lock neighbours,
+    change-point cap naming, and forged stream keys."""
+
+    # -- a seconds cap, however large, never speaks for blocks --
+
+    def test_seconds_cap_past_the_release_window_still_refuses_a_height_park(self):
+        self._install_clause(RECIPIENT, PAST_WINDOW_BODY)
+        self._warm()
+        ev = self._preflight(3, "blocks")
+        self.assertFalse(ev["admitted"], ev)
+        self.assertEqual(ev["max_hold_blocks"], 0, ev)
+        self.assertNotIn("max_hold_seconds", ev, ev)
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_height=self._head() + 3)
+        self.assertFalse(res["ok"], f"height park admitted: {res}")
+        self.assertIn("RECIPIENT_MAX_HOLD", str(res))
+        policy = res["details"]["recipient_policy"]
+        self.assertEqual(policy["max_hold_blocks"], 0, res)
+        self.assertNotIn("max_hold_seconds", policy, res)
+
+    def test_past_window_seconds_cap_admits_the_longest_legal_time_park(self):
+        self._install_clause(RECIPIENT, PAST_WINDOW_BODY)
+        self._warm()
+        ev = self._preflight(7776000, "seconds")
+        self.assertTrue(ev["admitted"], ev)
+        escrow_before = self._escrow_total()
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_time=int(time.time()) + 7700000)
+        self.assertTrue(res["ok"], f"legal time park refused: {res}")
+        self._mine(expected_txs=1)
+        self.assertEqual(self._escrow_total() - escrow_before, 100)
+
+    # -- a neighbouring time-lock literal changes nothing --
+
+    def test_hold_cap_named_exactly_when_clause_also_names_a_time_lock(self):
+        self._install_clause(RECIPIENT, TIMELOCK_CAP_BODY)
+        self._warm()
+        ev = self._preflight(600, "seconds")
+        self.assertTrue(ev["admitted"], ev)
+        ev = self._preflight(601, "seconds")
+        self.assertFalse(ev["admitted"], ev)
+        self.assertEqual(ev["max_hold_seconds"], 600, ev)
+        self.assertEqual(ev["cap_kind"], "threshold", ev)
+
+    # -- caps are named only from change points this payment fixes --
+
+    def test_a_holed_clause_quotes_no_cap_from_its_change_points(self):
+        self._install_clause(RECIPIENT, HOLED_BODY)
+        self._warm()
+        # The hole is real on the engine: a hold inside the upper band
+        # is admitted even though a smaller one is refused.
+        ev = self._preflight(5500, "seconds")
+        self.assertTrue(ev["admitted"], ev)
+        ev = self._preflight(200, "seconds")
+        self.assertFalse(ev["admitted"], ev)
+        self.assertEqual(ev["cap_kind"], "rule", ev)
+        self.assertNotIn("max_hold_seconds", ev, ev)
+        self.assertNotIn("max_hold_blocks", ev, ev)
+
+    def test_hold_cap_named_from_a_change_point_this_payment_fixes(self):
+        self._install_clause(RECIPIENT, STREAM_CAP_BODY)
+        self._warm()
+        ev = self._preflight(600, "seconds", amount=600)
+        self.assertTrue(ev["admitted"], ev)
+        ev = self._preflight(601, "seconds", amount=600)
+        self.assertFalse(ev["admitted"], ev)
+        self.assertEqual(ev["max_hold_seconds"], 600, ev)
+        self.assertEqual(ev["cap_kind"], "threshold", ev)
+
+    def test_no_cap_when_the_other_stream_is_not_fixed_by_this_payment(self):
+        self._install_clause(RECIPIENT, UNFIXED_STREAM_BODY)
+        self._warm()
+        ev = self._preflight(200, "seconds")
+        self.assertFalse(ev["admitted"], ev)
+        self.assertNotIn("max_hold_seconds", ev, ev)
+        self.assertNotIn("max_hold_blocks", ev, ev)
+
+    # -- forged stream keys never reach the clause --
+
+    def test_forged_hold_key_shapes_never_reach_the_recipient_clause(self):
+        """A hand-built input map spelling the hold/context streams
+        17 / "17" / "i17" (and 16 likewise) with forged values: the gate
+        overlay forces exactly one shape per stream, so the clause
+        judges the plain final payment this is — not the forged
+        999999-block height park the extra shapes describe."""
+        from consensus import sender_policy
+
+        self._install_clause(RECIPIENT, CAP_BODY)
+        self._warm()
+        clause_for = chain_state._lifecycle_manager.rule_offers.clause_for
+        forged = {
+            1: "100",
+            3: "{ #x" + SENDER + " }:bv[384]",
+            17: "999999", "17": "999999", "i17": "999999",
+            16: "3", "16": "3", "i16": "3",
+        }
+        blocked, info = sender_policy.recipient_clause_blocks(
+            clause_for, RECIPIENT, forged, hold=0, context=1, pool="apply")
+        self.assertFalse(blocked, info)
+
+
 if __name__ == "__main__":
     unittest.main()
