@@ -207,24 +207,39 @@ def test_resend_a_b_a_under_authority(authority, _mining_allowed):
     """Send A (o26 = {7} && o27 = {9}), then B (o26 = {3}), then A again,
     one block each. The view at the third block runs the first unit's
     terms again -- the resend is a new revision, not an accumulation
-    replay (which would end at [A, B] with o26 = 3) -- and the ledger
-    names the resend as B's displacer. Then the snapshots are wiped and
-    the same heights must be answered from the journal cut (B02-1),
-    with identical text and hash, marked derived."""
+    replay (which would end at [A, B] with o26 = 3) -- and the journal
+    records all three sends as accepted revisions, the resend included.
+    Then the snapshots are wiped and the same heights must be answered
+    from the journal cut (B02-1), with identical text and hash, marked
+    derived."""
     sk, pk = _sender("authority-resend")
-    tx_hashes = []
     for seq, rule in enumerate((PROBE_A, PROBE_B, PROBE_A)):
         out = _submit(sk, pk, {"0": rule}, seq=seq)
         assert out.get("ok"), f"submit seq={seq} refused: {out}"
-        tx_hashes.append(out["tx_hash"])
         _mine()
 
-    ledger = {e["tx_hash"]: e for e in active_rules.survival_ledger()}
-    assert all(h in ledger for h in tx_hashes), (
-        f"ledger lacks a submitted unit: {sorted(ledger)} vs {tx_hashes}")
-    first, displaced, resend = (ledger[h] for h in tx_hashes)
-    h_first, h_displaced, h_resend = (
-        e["block_number"] for e in (first, displaced, resend))
+    # The journal is the authority-side record of the resend: three
+    # REVISION entries, A then B then A again, each accepted, and the
+    # block commits' spec_revision advancing 1, 2, 3 -- the resend was
+    # recorded as a new revision, not deduplicated against the first
+    # send. (The survival-ledger form of this same case, over recorded
+    # outcomes, is test_resend_a_b_a_survival_ledger in the mock suite.)
+    import tau_journal
+
+    revisions = [
+        e for e in tau_journal.journal_from_rows(
+            db.committed_journal_entries()).entries()
+        if e.kind == tau_journal.REVISION and e.rule_text in (PROBE_A, PROBE_B)
+    ]
+    assert [e.rule_text for e in revisions] == [PROBE_A, PROBE_B, PROBE_A], \
+        [e.rule_text for e in revisions]
+    assert all(
+        (e.outcome or "").startswith("ACCEPTED") for e in revisions), \
+        [e.outcome for e in revisions]
+    commits = [db.block_commit_at_height(h) for h in (1, 2, 3)]
+    assert all(c is not None for c in commits), commits
+    assert [c["spec_revision"] for c in commits] == [1, 2, 3], commits
+    h_first, h_displaced, h_resend = 1, 2, 3
 
     at2 = _answer_at(h_displaced)
     assert "o26[t]:bv[24] = { 3 }:bv[24]" in at2["effective_spec"], at2
@@ -232,12 +247,6 @@ def test_resend_a_b_a_under_authority(authority, _mining_allowed):
     assert "o26[t]:bv[24] = { 7 }:bv[24]" in at3["effective_spec"], at3
     assert "o27[t]:bv[24] = { 9 }:bv[24]" in at3["effective_spec"], at3
     assert "{ 3 }" not in at3["effective_spec"], at3
-
-    assert first["status"] == "in_force", first
-    assert displaced["status"] == "displaced", displaced
-    assert resend["tx_hash"] in displaced["displaced_by"], displaced
-    assert resend["status"] == "in_force", resend
-    assert resend["spec_revision_after"] == 3, resend
 
     snapshots = {h: _answer_at(h)
                  for h in (h_first, h_displaced, h_resend)}

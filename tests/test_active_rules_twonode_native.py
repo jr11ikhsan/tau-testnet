@@ -22,7 +22,8 @@ rule -- one block each. Asserted on BOTH nodes, per height:
   * after the snapshots are wiped on both nodes, the journal-cut
     answer (B02-1) agrees too, carries `derived: "journal_cut"`, and
     at block 3 runs the first unit's terms (o26 = 7, o27 = 9);
-  * the per-transaction rule outcomes (the survival ledger) agree;
+  * the committed journal record (revision texts in order, and each
+    block commit's spec_revision) agrees;
   * getpaymentconditions (B02-5) for a clause-free pair agrees: same
     block, same spec, both sides neutral, allowed.
 
@@ -105,8 +106,6 @@ def main():
     import config
     import chain_state
     import db
-    import tau_manager
-    import tau_native
     from py_ecc.bls import G2Basic as bls
     from block import Block
     from commands import createblock, getactiverules, getpaymentconditions
@@ -115,26 +114,56 @@ def main():
     from consensus import active_rules
     from types import SimpleNamespace
 
-    iface = tau_native.TauInterface(os.path.join(REPO, "genesis.tau"))
+    # --- Boot: the single-node native suite's boot (conftest node_state
+    # + the authority fixture of test_active_rules_issue42_native.py),
+    # on this child's own DB. Production nodes run the authoritative
+    # worker, and it matters here: direct-mode admission probes an op-0
+    # rule as if it were a policy clause and refuses it ("clause cannot
+    # be evaluated: it reads no input stream"), so the children run
+    # authority mode exactly like the single-node authority harness.
+    import threading
+
+    import tau_admission
+    import tau_authority as auth
+    import tau_commit as tc
+    from consensus.governance import ConsensusLifecycleManager
+
     config.set_database_path(DB_PATH)
-    if not config.MINER_PRIVKEY:
-        _priv = config._load_miner_privkey_from_path(
-            os.path.join(config.DATA_LOCAL_DIR, "test_miner.key"))
-        _pub = config._load_miner_pubkey_from_path(
-            os.path.join(config.DATA_LOCAL_DIR, "test_miner.pub"))
-        if not _priv or not _pub:
-            result["skip"] = "data_local/test_miner.key absent"
-            finish(0)
-        config.MINER_PRIVKEY = _priv
-        config.MINER_PUBKEY = _pub
     if db._db_conn:
         db._db_conn.close()
     db._db_conn = None
-    chain_state._balances.clear()
-    chain_state._sequence_numbers.clear()
     db.init_db()
-    tau_manager.tau_direct_interface = iface
-    tau_manager.tau_ready.set()
+    db.clear_mempool()
+    config.MINER_PRIVKEY = "0" * 63 + "1"
+    chain_state._balances = {}
+    chain_state._sequence_numbers = {}
+    chain_state._application_rules_state = ""
+    chain_state._lifecycle_manager = ConsensusLifecycleManager()
+    if RESTART:
+        if not chain_state.load_state_from_db():
+            raise RuntimeError("load_state_from_db failed on restart")
+    else:
+        chain_state.load_genesis("data/genesis.json")
+    chain_state._lifecycle_manager = ConsensusLifecycleManager()
+
+    baseline = "always ( " + open(
+        os.path.join(REPO, "genesis.tau")).read().strip() + " )."
+    owner = auth.AuthoritativeTauOwner(
+        ready=threading.Event(), program_baseline=baseline)
+    auth.reset(owner)
+    tc.registry().discard()
+    tau_admission.reset()
+    if hasattr(active_rules, "reset_spec_mirror"):
+        active_rules.reset_spec_mirror()
+    _env = dict(os.environ)
+    _env["PYTHONPATH"] = REPO + os.pathsep + _env.get("PYTHONPATH", "")
+    owner.initialize(cwd=REPO, env=_env)
+
+    patch("consensus.engine.TauConsensusEngine.query_eligibility",
+          return_value=True).start()
+    patch("consensus.engine.TauConsensusEngine.verify_block_header",
+          return_value=True).start()
+    patch("consensus.bls.verify", lambda *a, **k: True).start()
 
     sk = bls.KeyGen(b"b02-twonode-sender".ljust(32, b"_"))
     sender = bls.SkToPk(sk).hex()
@@ -142,39 +171,8 @@ def main():
         bls.KeyGen(b"b02-twonode-stranger".ljust(32, b"_"))).hex()
     result["sender"] = sender
     result["stranger"] = stranger
-
-    if RESTART:
-        if not chain_state.load_state_from_db():
-            raise RuntimeError("load_state_from_db failed on restart")
-    else:
-        chain_state.load_genesis("data/genesis.json")
-        db.clear_mempool()
+    if not RESTART:
         chain_state._balances[sender] = 1000000
-        chain_state._lifecycle_manager.active_validators = {
-            config.MINER_PUBKEY.lower()}
-        chain_state._lifecycle_manager.recompute_approval_threshold()
-
-        def seed_rule(rule_text, label):
-            out = tau_manager.communicate_with_tau(
-                rule_text=rule_text, target_output_stream_index=0,
-                apply_rules_update=False, source="seed-" + label)
-            if "error" in str(out).lower():
-                raise RuntimeError("seeding " + label + " failed")
-
-        seed_rule(open(os.path.join(
-            REPO, "rules", "04_handle_valid_transfer.tau")).read(),
-            "transfer-rule")
-        seed_rule(chain_state._preprocess_tau_spec_text(
-            json.load(open("data/genesis.json"))["consensus_rules"]),
-            "genesis-consensus")
-        patch.dict("os.environ", {"TAU_FORCE_TEST": "0"}).start()
-        patch("commands.createblock._BLS_AVAILABLE", True).start()
-        patch("block.bls_signing_available", return_value=True).start()
-        patch("consensus.engine.TauConsensusEngine.verify_block_header",
-              return_value=True).start()
-        patch("consensus.engine.TauConsensusEngine.query_eligibility",
-              return_value=True).start()
-        patch("consensus.bls.verify", lambda *a, **k: True).start()
 
     container = SimpleNamespace(db=db, chain_state=chain_state)
 
@@ -197,14 +195,20 @@ def main():
         return out
 
     def collect_receipts():
-        out = {}
-        for r in active_rules.survival_ledger():
-            out.setdefault(str(r["block_number"]), []).append(
-                {"tx_hash": r["tx_hash"], "status": r["status"],
-                 "outcome": r["outcome"]})
-        for key in out:
-            out[key].sort(key=lambda e: e["tx_hash"])
-        return out
+        # The journal is the record both nodes must agree on: every
+        # REVISION text in order (genesis units first, then the
+        # scenario's), plus each block commit's spec_revision.
+        import tau_journal
+        entries = tau_journal.journal_from_rows(
+            db.committed_journal_entries()).entries()
+        texts = [e.rule_text for e in entries
+                 if e.kind == tau_journal.REVISION and e.rule_text]
+        commits = {}
+        tip = db.canonical_tip_height()
+        for h in range(1, (tip or 0) + 1):
+            commit = db.block_commit_at_height(h)
+            commits[str(h)] = commit["spec_revision"] if commit else None
+        return {"revision_texts": texts, "commit_revisions": commits}
 
     def payment_probe():
         data = json.loads(getpaymentconditions.execute(
@@ -307,15 +311,22 @@ def test_rules_view_agrees_across_two_nodes(tmp_path):
     restarted = _run_child("follower", tmp_path, restart=True)
 
     heights = [str(h) for h in range(1, len(RULES) + 1)]
-    # Same head, same snapshot answers, same ledger on both nodes.
+    # Same head, same snapshot answers, same journal on all three
+    # processes (proposer, follower, restarted follower).
     assert proposer["heads"] == follower["heads"]
     for h in heights:
         for key in ("spec_hash", "spec_revision"):
             assert proposer["answers"][h][key] == follower["answers"][h][key]
-        assert proposer["receipts"][h] == follower["receipts"][h]
-    # The resend case in the ledger: block 2's unit displaced by block 3's.
-    assert proposer["receipts"]["2"][0]["status"] == "displaced"
-    assert proposer["receipts"]["3"][0]["status"] == "in_force"
+    assert proposer["receipts"] == follower["receipts"] == \
+        restarted["receipts"]
+    # The scenario's four units were recorded as revisions, in order
+    # (the resend of A included -- no deduplication), and the commits'
+    # spec_revision advanced once per block.
+    texts = proposer["receipts"]["revision_texts"]
+    stream = iter(texts)
+    assert all(any(t == want for t in stream) for want in RULES), texts
+    assert proposer["receipts"]["commit_revisions"] == {
+        str(h): h for h in range(1, len(RULES) + 1)}
 
     # Journal-cut answers agree across both nodes AND the restarted
     # follower, and run the first unit's terms at block 3.
