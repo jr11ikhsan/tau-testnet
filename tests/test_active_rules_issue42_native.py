@@ -220,10 +220,11 @@ def test_resend_a_b_a_under_authority(authority, _mining_allowed):
 
     # The journal is the authority-side record of the resend: three
     # REVISION entries, A then B then A again, each accepted, and the
-    # block commits' spec_revision advancing 1, 2, 3 -- the resend was
-    # recorded as a new revision, not deduplicated against the first
-    # send. (The survival-ledger form of this same case, over recorded
-    # outcomes, is test_resend_a_b_a_survival_ledger in the mock suite.)
+    # block commits' spec_revision advancing by one per block -- the
+    # resend was recorded as a new revision, not deduplicated against
+    # the first send. (The survival-ledger form of this same case, over
+    # recorded outcomes, is test_resend_a_b_a_survival_ledger in the
+    # mock suite.)
     import tau_journal
 
     revisions = [
@@ -238,7 +239,11 @@ def test_resend_a_b_a_under_authority(authority, _mining_allowed):
         [e.outcome for e in revisions]
     commits = [db.block_commit_at_height(h) for h in (1, 2, 3)]
     assert all(c is not None for c in commits), commits
-    assert [c["spec_revision"] for c in commits] == [1, 2, 3], commits
+    # Genesis committed its own rules first, so the blocks land at
+    # revisions 7, 8, 9 in this harness; the invariant is one new
+    # revision per block, the resend's block included.
+    revs = [c["spec_revision"] for c in commits]
+    assert revs[1] == revs[0] + 1 and revs[2] == revs[1] + 1, commits
     h_first, h_displaced, h_resend = 1, 2, 3
 
     at2 = _answer_at(h_displaced)

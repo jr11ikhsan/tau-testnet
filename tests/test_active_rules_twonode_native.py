@@ -159,6 +159,34 @@ def main():
     _env["PYTHONPATH"] = REPO + os.pathsep + _env.get("PYTHONPATH", "")
     owner.initialize(cwd=REPO, env=_env)
 
+    # conftest's fake_engine, mirrored: tau_manager's advisory paths
+    # (the fee gate in createblock waits on tau_ready; fee quotes read
+    # the direct interface) get the harness's canned answers, while the
+    # authoritative worker above does the real rule work.
+    import tau_manager
+
+    class _FeeStub:
+        def communicate(self, rule_text=None, target_output_stream_index=0,
+                        input_stream_values=None, source="unknown",
+                        apply_rules_update=True, node_generated=False):
+            return "1"
+
+        def communicate_multi(self, rule_text=None, input_stream_values=None,
+                              source="unknown", apply_rules_update=True,
+                              node_generated=False):
+            return {1: "1", 6: "1", 7: "1"}
+
+        def update_spec(self, new_spec):
+            pass
+
+        def get_current_spec(self):
+            return "always o0[t] = 1."
+
+    tau_manager.tau_direct_interface = _FeeStub()
+    tau_manager.tau_test_mode = False
+    tau_manager._rules_handler = None
+    tau_manager.tau_ready.set()
+
     patch("consensus.engine.TauConsensusEngine.query_eligibility",
           return_value=True).start()
     patch("consensus.engine.TauConsensusEngine.verify_block_header",
