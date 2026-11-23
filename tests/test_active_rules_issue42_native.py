@@ -212,16 +212,19 @@ def test_resend_a_b_a_under_authority(authority, _mining_allowed):
     the same heights must be answered from the journal cut (B02-1),
     with identical text and hash, marked derived."""
     sk, pk = _sender("authority-resend")
+    tx_hashes = []
     for seq, rule in enumerate((PROBE_A, PROBE_B, PROBE_A)):
         out = _submit(sk, pk, {"0": rule}, seq=seq)
         assert out.get("ok"), f"submit seq={seq} refused: {out}"
+        tx_hashes.append(out["tx_hash"])
         _mine()
 
-    receipts = sorted(
-        active_rules.rule_receipts(), key=lambda r: r["block_height"])
-    assert len(receipts) == 3, f"expected 3 rule receipts: {receipts}"
-    first, displaced, resend = receipts
-    h_first, h_displaced, h_resend = (r["block_height"] for r in receipts)
+    ledger = {e["tx_hash"]: e for e in active_rules.survival_ledger()}
+    assert all(h in ledger for h in tx_hashes), (
+        f"ledger lacks a submitted unit: {sorted(ledger)} vs {tx_hashes}")
+    first, displaced, resend = (ledger[h] for h in tx_hashes)
+    h_first, h_displaced, h_resend = (
+        e["block_number"] for e in (first, displaced, resend))
 
     at2 = _answer_at(h_displaced)
     assert "o26[t]:bv[24] = { 3 }:bv[24]" in at2["effective_spec"], at2
@@ -349,28 +352,31 @@ def test_forged_journal_fingerprint_rejected_under_authority(
         {"outcome": "ACCEPTED_UNCHANGED", "present": [],
          "progressed": False, "values": {}},
         sort_keys=True, separators=(",", ":"))
-    old_links = {e.seq: e.link for e in entries}
+    # Compute the forged chain BEFORE taking db._db_lock: the lock is
+    # not re-entrant, and db read helpers acquire it themselves.
+    forged_chain = []
+    prev = None
+    for entry in entries:
+        fixed = entry
+        if entry.seq == target.seq:
+            fixed = replace(fixed, result_fingerprint=forged_fp)
+        fixed = replace(fixed, prev=prev)
+        fixed = replace(fixed, link=fixed.compute_link())
+        forged_chain.append(fixed)
+        prev = fixed.link
     with db._db_lock:
         cur = db._db_conn.cursor()
         cur.execute(
             "UPDATE tau_journal_v1 SET result_fp = ? WHERE seq = ?",
             (forged_fp, target.seq))
-        prev = None
-        new_links = {}
-        for entry in tau_journal.journal_from_rows(
-                db.committed_journal_entries()).entries():
-            fixed = replace(entry, prev=prev)
-            fixed = replace(fixed, link=fixed.compute_link())
-            new_links[entry.seq] = fixed.link
+        for old, fixed in zip(entries, forged_chain):
             cur.execute(
                 "UPDATE tau_journal_v1 SET prev = ?, link = ? WHERE seq = ?",
                 (fixed.prev, fixed.link, fixed.seq))
-            prev = fixed.link
-        for seq, old_link in old_links.items():
             cur.execute(
                 "UPDATE block_commits_v1 SET journal_head = ? "
                 "WHERE journal_head = ?",
-                (new_links[seq], old_link))
+                (fixed.link, old.link))
         db._db_conn.commit()
 
     # The forged record verifies: links and commit pointers agree.

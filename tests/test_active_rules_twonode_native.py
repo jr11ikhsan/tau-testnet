@@ -198,8 +198,8 @@ def main():
 
     def collect_receipts():
         out = {}
-        for r in active_rules.rule_receipts():
-            out.setdefault(str(r["block_height"]), []).append(
+        for r in active_rules.survival_ledger():
+            out.setdefault(str(r["block_number"]), []).append(
                 {"tx_hash": r["tx_hash"], "status": r["status"],
                  "outcome": r["outcome"]})
         for key in out:
