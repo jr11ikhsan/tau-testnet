@@ -64,6 +64,7 @@ from consensus.payout_rules import (
     TX_TYPE_REMOVE_PAYOUT_RULE,
     PayoutRuleBook,
     PayoutRuleShapeError,
+    parse_execute_payout_receipt_id,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
@@ -1948,6 +1949,7 @@ def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
             (int(t["period_index"]), int(t["total"]))
             for t in row.get("period_totals", [])
         ),
+        int(row.get("base_source", 0)),
     )
     settlement_rows = [
         (
@@ -1956,10 +1958,27 @@ def _tip_payout_book(row: Optional[Dict]) -> PayoutRuleBook:
             int(s["base_amount"]),
             int(s["total"]),
             int(s["execution_ts"]),
+            bytes.fromhex(s["receipt_id"]) if s.get("receipt_id") else b"",
         )
         for s in row.get("settlements", [])
     ]
-    return PayoutRuleBook.restore([entry_row], settlement_rows)
+    # The owner's receipts ride along (FIX 1-B), each with the consumed
+    # flag the full book reports: the settlement that consumed a receipt
+    # may belong to an earlier rule version this one-entry book does not
+    # hold, so consumption cannot be re-derived from its settlements
+    # alone — restore takes the flag from the row's sixth element.
+    receipt_rows = [
+        (
+            bytes.fromhex(r["receipt_id"]),
+            row["owner_pubkey"],
+            r["sender_pubkey"],
+            int(r["amount"]),
+            int(r["recorded_ts"]),
+            bool(r.get("consumed")),
+        )
+        for r in row.get("receipts", [])
+    ]
+    return PayoutRuleBook.restore([entry_row], settlement_rows, receipt_rows)
 
 
 def validate_install_payout_rule_payload(
@@ -2042,6 +2061,7 @@ def validate_execute_payout_rule_payload(
     """
     try:
         rule_id, settlement_id, base_amount = parse_execute_payout_rule(tx)
+        receipt_id = parse_execute_payout_receipt_id(tx)
     except PayoutRuleShapeError as exc:
         return format_error(f"Malformed execute_payout_rule: {exc}.")
 
@@ -2055,6 +2075,7 @@ def validate_execute_payout_rule_payload(
         rule_id, settlement_id, base_amount,
         tip_view.next_block_timestamp,
         tip_view.get_balance(row["owner_pubkey"]),
+        receipt_id=receipt_id,
     )
     if not decision.executed:
         return format_error(
@@ -2063,6 +2084,7 @@ def validate_execute_payout_rule_payload(
     return success({
         "rule_id": rule_id.hex(),
         "settlement_id": settlement_id.hex(),
+        "receipt_id": receipt_id.hex() if receipt_id else "",
         "total": decision.total,
         "period_index": decision.period_index,
         "legs": [
