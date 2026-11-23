@@ -71,6 +71,7 @@ import os
 import sys
 import time
 import traceback
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["TAU_ENV"] = "test"
@@ -188,8 +189,12 @@ def main():
     def head_dict():
         return db.get_canonical_head_block()
 
+    # Commands read container.chain_state / container.db (the mock
+    # suite's SimpleNamespace pattern); one shared instance.
+    CONTAINER = SimpleNamespace(chain_state=chain_state, db=db)
+
     def governance_active():
-        out = json.loads(getgovernance.execute("getgovernance", None))
+        out = json.loads(getgovernance.execute("getgovernance", CONTAINER))
         data = out.get("data") or {}
         return bool(data.get("recipient_policy_active"))
 
@@ -523,9 +528,9 @@ def main():
                     sendtx.queue_transaction(garbage[i % len(garbage)],
                                              propagate=False)
                 elif kind == 1:
-                    grp.execute("getrecipientpolicy " + garbage[i % 7], None)
+                    grp.execute("getrecipientpolicy " + garbage[i % 7], CONTAINER)
                 else:
-                    getbalance.execute("getbalance " + garbage[i % 7], None)
+                    getbalance.execute("getbalance " + garbage[i % 7], CONTAINER)
                 answered += 1
             except Exception:
                 pass
