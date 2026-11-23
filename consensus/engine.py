@@ -45,15 +45,18 @@ from .grants import (
     parse_set_grant_shared_cap,
 )
 from .payout_rules import (
+    FORM_TAU_RULE,
     PAYOUT_RULE_TX_TYPES,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
     TX_TYPE_REMOVE_PAYOUT_RULE,
     PayoutRuleBook,
     PayoutRuleShapeError,
+    decode_clause_legs,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
+    payout_clause_inputs,
 )
 from .receive_routes import (
     CREDIT_ORDINARY_TRANSFER,
@@ -1704,6 +1707,30 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             # would wrap to a huge bv value and silently satisfy the cooldown).
             return str(max(0, min(elapsed, tau_defs.COOLDOWN_NEVER_SENT)))
 
+        def _standing_paid_current_period(addr: Optional[str]) -> str:
+            """i17: "1" when `addr`'s current standing period is recorded paid.
+
+            The rule-readable projection of the standing book's
+            paid-for-period facts (tau_defs.STANDING_PAID_STREAM_INDEX):
+            1 when at least one of the sender's authorizations has the
+            period containing the block timestamp recorded paid, else 0
+            — per account, across all its authorizations. Read through
+            the same lifecycle view the transfer seam reads its books
+            from: the parent snapshot plus this block's earlier
+            transactions (standing mutations land at each transaction's
+            own end-of-tx site, so a transfer never sees its own
+            transaction's uncommitted standing changes), and proposer
+            and verifier walking the same block compute the same value.
+            Fed always, like i2.
+            """
+            if not addr:
+                return "0"
+            book = _standing_payment_book(lifecycle_mgr)
+            if book is None:
+                return "0"
+            return "1" if book.has_paid_period_containing(
+                addr, int(block_timestamp or 0)) else "0"
+
         def _lifecycle_for_write():
             """This transaction's fork of the block lifecycle, made on the first write.
 
@@ -2023,6 +2050,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     # is deterministic across both (issue #20).
                     2: _parent_bal(from_addr),
                     **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                    # i17 (standing-paid fact): fed ALWAYS, like i2 — the
+                    # sender's current standing period, recorded paid or
+                    # not. Reserved (RESERVED_STREAMS), so the custom
+                    # merge below can never override the node's value.
+                    tau_defs.STANDING_PAID_STREAM_INDEX:
+                        _standing_paid_current_period(from_addr),
                     # i3/i4 are the real from/to pubkeys (immutable in
                     # the transfer tuple -> identical at admission and
                     # apply), so recipient-aware policy/fee rules are
@@ -3170,9 +3203,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 pr_balance = 0
                                 reason = "no payout rule with this id"
                             else:
-                                # The book computes the legs from the
-                                # stored program and the submitted inputs,
-                                # and checks them against the declared set,
+                                # The book computes the legs — from the
+                                # stored program (declared form) or from
+                                # stepping the owner's clause over the
+                                # node-built input map (Tau form) — and
+                                # checks them against the declared set,
                                 # both caps and the owner's balance as this
                                 # tx sees it; the transfers below then move
                                 # exactly those legs through the ordinary
@@ -3181,11 +3216,46 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 # same evaluation an ordinary transfer of
                                 # theirs would face.
                                 pr_balance = _read_bal(pr_entry.owner_pubkey)
-                                pr_decision = pr_book.evaluate_execution(
-                                    pr_rule_id, pr_settlement_id, pr_base,
-                                    pr_ts, pr_balance,
-                                )
-                                reason = "" if pr_decision.executed else pr_decision.reason
+                                pr_decision = None
+                                reason = ""
+                                pr_clause_legs = None
+                                if pr_entry.form == FORM_TAU_RULE:
+                                    outputs, detail = (
+                                        sender_policy.clause_outputs(
+                                            pr_entry.clause_text,
+                                            payout_clause_inputs(
+                                                pr_entry,
+                                                sender if isinstance(
+                                                    sender, str) else "",
+                                                pr_base, pr_ts, pr_balance,
+                                                pr_book.period_paid_total(
+                                                    pr_entry, pr_ts),
+                                            ),
+                                            pool="apply",
+                                        )
+                                    )
+                                    if outputs is None:
+                                        reason = (
+                                            "the payout rule's clause did "
+                                            f"not produce legs ({detail})"
+                                        )
+                                    else:
+                                        pr_clause_legs, why = (
+                                            decode_clause_legs(
+                                                pr_entry, outputs)
+                                        )
+                                        if pr_clause_legs is None:
+                                            reason = why
+                                if not reason:
+                                    pr_decision = pr_book.evaluate_execution(
+                                        pr_rule_id, pr_settlement_id, pr_base,
+                                        pr_ts, pr_balance,
+                                        clause_legs=pr_clause_legs,
+                                    )
+                                    reason = (
+                                        "" if pr_decision.executed
+                                        else pr_decision.reason
+                                    )
                         if pr_rule_id is None or reason:
                             tx_receipt["logs"].append(f"Payout rule execution ignored: {reason}")
                             tx_receipt["reason"] = "payout_rule_not_executed"
@@ -3664,6 +3734,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         # here would diverge replay from mining.
                                         2: _parent_bal(from_addr),
                                         **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                                        # i17 (standing-paid fact), fed
+                                        # always like the fee-era path.
+                                        tau_defs.STANDING_PAID_STREAM_INDEX:
+                                            _standing_paid_current_period(from_addr),
                                         # Real from/to pubkeys for eval/width parity
                                         # with the fee-era path.
                                         3: "{ #x" + str(from_addr) + " }:bv[384]",
@@ -3757,6 +3831,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     fee_query_inputs = {
                         1: "0", 2: _parent_bal(sender), 3: "0", 4: "0",
                         **({16: _since_last_transfer(sender)} if cooldown_active else {}),
+                        # i17 (standing-paid fact) for the sender, fed
+                        # always like i2.
+                        tau_defs.STANDING_PAID_STREAM_INDEX:
+                            _standing_paid_current_period(sender),
                         # NOTE: key order here (5 before 12) intentionally
                         # matches commands/sendtx.py's transfer-less fee query,
                         # since insertion order is what the shrink layer sees.
@@ -4026,6 +4104,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         "rule_id": pending_payout_install.rule_id.hex(),
                         "action": "installed",
                         "owner_pubkey": pending_payout_install.owner_pubkey,
+                        "form": pending_payout_install.form,
                         "version": pending_payout_install.version,
                     }
                     tx_receipt["logs"].append(
@@ -4050,15 +4129,23 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                      pr_settlement_id, pr_base) = pending_payout_execution
                     # Same fork, same inputs as the branch's
                     # evaluate_execution: the settled decision is the staged
-                    # one by construction.
+                    # one by construction. For a Tau-form rule the staged
+                    # decision's legs are handed back in — the clause is
+                    # not stepped a second time, so the commit cannot
+                    # compute different legs than the branch validated.
                     settled = pr_book.execute(
                         pr_entry.rule_id, pr_settlement_id, pr_base,
                         int(block_timestamp or 0), pr_balance,
+                        clause_legs=(
+                            _pr_decision.legs
+                            if pr_entry.form == FORM_TAU_RULE else None
+                        ),
                     )
                     tx_receipt["payout_event"] = {
                         "rule_id": pr_entry.rule_id.hex(),
                         "action": "executed",
                         "owner_pubkey": pr_entry.owner_pubkey,
+                        "form": pr_entry.form,
                         "settlement_id": pr_settlement_id.hex(),
                         "base_amount": pr_base,
                         "legs": [

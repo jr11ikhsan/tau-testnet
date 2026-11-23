@@ -193,13 +193,18 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         # set, the leg program, both caps and the period shape. The apply
         # path installs exactly these root fields, so anything omitted here
         # could be rewritten by a proposer into a different rule than the
-        # owner chose — above all the recipients and the caps.
+        # owner chose — above all the recipients and the caps. The form and
+        # (for the Tau form) the clause text fix the rule exactly as the
+        # leg program does, so they are signed too.
         signing_dict["payout_recipients"] = payload.get("payout_recipients")
         signing_dict["payout_legs"] = payload.get("payout_legs")
+        signing_dict["payout_form"] = payload.get("payout_form")
+        signing_dict["payout_clause"] = payload.get("payout_clause")
         signing_dict["payout_max_per_execution"] = payload.get("payout_max_per_execution")
         signing_dict["payout_max_per_period"] = payload.get("payout_max_per_period")
         signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
         signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
+        signing_dict["payout_periods_from_ts"] = payload.get("payout_periods_from_ts")
         signing_dict["payout_version"] = payload.get("payout_version")
     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
         # Nothing beyond the signer's identity (sender_pubkey is always

@@ -1,58 +1,71 @@
-"""Bounty 01, stage 5: the 5,000 grant (named case 5) across TWO nodes on
-the native tau-lang engine — the two-node demo for the refunds PR.
+"""Bounty 01, FIX-1A: named case 5 in the Tau-clause form, with a signed
+periods_from anchor, across TWO nodes on the native tau-lang engine.
 
-Kept in its own file so the real-Tau CI job can register exactly this file
-beside tests/test_grants_native.py. The book, engine and single-node native
-suites already prove named case 5 on one node; this file proves the same
-case end-to-end on two: the refund path settles identically on a node that
-only ever INGESTS the blocks.
+Kept in its own file so the real-Tau CI job can register exactly this
+file beside tests/test_payout_tau_rule_native.py. The single-node
+native suite proves the grant example as a Tau payout rule and the
+periods_from grid at book level; this file proves the two together,
+end to end, on two nodes: the same settlement stream lands identically
+on a node that only ever INGESTS the blocks, with the period grid
+counted from the signed anchor — never from the install day.
 
-What "two nodes" means here, precisely: two child processes, each a full
-node state instance with its OWN sqlite database, booted from the same
-genesis artifact and miner identity exactly as the single-node native
-suite boots (the repo's own native-subprocess pattern —
-tests/test_replay_determinism_native.py, and the recipient-controls
-two-node suite). The proposer produces blocks; blocks cross to the
-follower as serialized dicts (Block.to_dict(), the codebase's block wire
-format; Block.from_dict() re-verifies hash and body on import), and the
-follower ingests each one through chain_state.process_new_block — the
-standard network/import ingestion path. No live sockets are opened;
-everything else — admission, apply, the release schedule, the expiry
-sweep — is the production code path on both sides.
+What "two nodes" means here is exactly what the grants two-node suite
+(test_grants_twonode_native.py) established: two child processes, each
+a full node state instance with its OWN sqlite database, booted from
+the same genesis artifact and miner identity; the proposer produces
+blocks; blocks cross to the follower as serialized dicts
+(Block.to_dict() / Block.from_dict()) and the follower ingests each
+through chain_state.process_new_block. Blocks after the timeline
+leaves the wall clock are hand-built with the miner's own header
+computation (a dry-run of engine.apply_block, the resulting state hash
+embedded, the proof signed with the miner key), and the ingestion
+future-drift bound is widened through config's own env knob
+(TAU_MAX_BLOCK_FUTURE_DRIFT) — both children run the identical setting.
 
-The scenario is the maintainer's named case 5 with the official numbers,
-in the exact shape the mock suites pin
-(test_grants_engine_bounty01.py::test_named_case_5_end_to_end): a funder
-stocks a 5,000 grant releasing 500/week; the beneficiary draws 500 in
-each of weeks 1, 2 and 3 (1,500 total, each draw submitted by a third
-party through the real sendtx admission); at the deadline an empty block
-settles the sweep refund — exactly 3,500 back to the funder, fee-free.
-Both nodes checkpoint after every step (height, head hash, state hash,
-balances, sequences, grant accounting) and the parent asserts the two
-streams are identical, plus the case's numbers on the stream itself.
+The scenario, with the official numbers: a grant account holds 5,000.
+Its owner's Tau clause is the grant's terms — before the deadline it
+pays Bob what the current period still owes of 500 (500 minus the
+period's paid total at i26, which the node feeds from the book); at or
+after the deadline it pays the funder the account's whole remaining
+balance (read at i2). The rule's periods are WEEKS counted from the
+signed periods_from anchor (the "1 December" of the case), and the
+install lands two weeks and three days after that anchor — mid-week-2
+of the anchored grid, at a moment the install-anchored grid would call
+week 0. The draws then discriminate the two grids in the money path
+itself, not just in bookkeeping:
 
-Calendar, honestly: the grant's December is anchored at the parent's
-spawn time (anchor = wall clock minus one hour, passed to both children
-identically through the environment, so both sign and seal the same
-fields), and the eight weeks to the deadline are compressed into block
-timestamps — the chain clock advances by block headers, which is the
-only clock grant semantics ever read (consensus/grants.py: conditions
-are evaluated against the block timestamp, never a wall clock). Two
-consequences, both deliberate:
+- draw 1, in anchored week 2: settles 500, recorded under anchored
+  period 2 — the install grid would have recorded period 0;
+- a second execution in the same anchored week settles nothing (the
+  clause reads i26 = 500 for that week and computes no leg), on both
+  nodes;
+- draw 2, at anchor + 3 weeks + 10s: PAYS 500. The anchored grid calls
+  this week 3 (i26 reads 0); the install grid — whose week 0 runs to
+  install + 7 days, three days later — would still call it week 0 and
+  read i26 = 500, refusing the draw. The grids give different answers
+  here and the chain follows the anchored one;
+- draw 3, in anchored week 4: settles 500 (1,500 drawn in total);
+- after the deadline, one more execution (base 1 — the amount comes
+  from the clause's state inputs) refunds exactly 3,500 to the funder.
 
-- Blocks are hand-built after the timeline leaves the wall clock, using
-  the miner's own header computation (a dry-run of engine.apply_block
-  with createblock's interpreter save/restore, the resulting state hash
-  embedded, the proof signed with the miner key) — createblock stamps
-  wall time, which would regress against the advanced tip. Each node
-  dry-runs every block itself before ingesting the identical bytes, so
-  each records its own apply verdict.
-- Ingestion bounds a block's future drift against the wall clock
-  (chain_state._validate_block_timestamp; default 120s — an anti-spam
-  guard, not grant semantics). The children widen it through the
-  codebase's own configuration knob (the TAU_MAX_BLOCK_FUTURE_DRIFT
-  environment variable config.py reads) so the follower can ingest the
-  schedule-advancing blocks. Both children run the identical setting.
+The declared caps (3,500 per execution, 3,500 per period) never bind
+in this scenario: the weekly discipline is the clause's, computed over
+the anchored i26 feed — which is precisely the quantity periods_from
+re-anchors. Both nodes checkpoint after every step (height, head hash,
+state hash, balances, sequences, the payout book's period totals and
+settlement list) and the parent asserts the two streams are identical,
+plus the case's numbers on the stream itself.
+
+Installation is the one deliberate shortcut, stated plainly: both
+children install the identical entry with the book's own install call
+at boot — the single-node native suite's idiom for this book — rather
+than through an install transaction (that path is covered by the
+admission and mock suites). The case's numbers require it: an install
+transaction charges the grant account its own install fee (measured
+10 in this suite's first CI run), after which the account holds 4,990
+and the remainder is 3,490, not the case's exact 3,500. With the book
+install the account holds exactly 5,000, and every number below is
+the official one, to the unit.
 """
 import json
 import os
@@ -62,7 +75,7 @@ import sys
 
 import pytest
 
-from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, pubkey_hex
+from bls_keys import SK_ALICE, SK_BOB, SK_CAROL, SK_MALLORY, pubkey_hex
 
 
 def _native_available():
@@ -80,8 +93,9 @@ pytestmark = pytest.mark.skipif(
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 
 FUNDER = pubkey_hex(SK_ALICE)
-BENEFICIARY = pubkey_hex(SK_BOB)
-SUBMITTER = pubkey_hex(SK_CAROL)
+BOB = pubkey_hex(SK_BOB)
+EXECUTOR = pubkey_hex(SK_CAROL)
+OWNER = pubkey_hex(SK_MALLORY)
 
 WEEK = 604_800
 
@@ -104,7 +118,7 @@ from unittest.mock import patch
 
 os.environ["TAU_ENV"] = "test"
 os.environ["TAU_FORCE_TEST"] = "0"
-# The scenario's blocks run up to eight weeks ahead of the wall clock;
+# The scenario's blocks run up to five weeks ahead of the wall clock;
 # widen the ingestion future-drift bound through config's own env knob
 # BEFORE config is imported anywhere in this process.
 os.environ["TAU_MAX_BLOCK_FUTURE_DRIFT"] = "6048000"
@@ -118,12 +132,14 @@ EVENTS_PATH = os.path.join(WORKDIR, "twonode_events.json")
 OUT_PATH = os.path.join(WORKDIR, "twonode_" + ROLE + ".json")
 
 FUNDER = %(FUNDER)r
-BENEFICIARY = %(BENEFICIARY)r
-SUBMITTER = %(SUBMITTER)r
+BOB = %(BOB)r
+EXECUTOR = %(EXECUTOR)r
+OWNER = %(OWNER)r
 
 WEEK = 604800
 DAY = 86400
-DEADLINE = T0 + 8 * WEEK
+INSTALL_TS = T0 + 2 * WEEK + 3 * DAY
+DEADLINE = T0 + 5 * WEEK
 TX_EXPIRY = T0 + 60 * DAY
 
 GENESIS_TAU = os.path.join(REPO, "genesis.tau")
@@ -146,27 +162,50 @@ def finish(code=0):
     os._exit(code)
 
 
+def grant_clause(bob_idx, funder_idx):
+    """The grant's terms as a Tau clause body (sender_policy wraps it).
+
+    Before the deadline: pay Bob what the current anchored period
+    still owes of the weekly 500 (500 - i26). At/after the deadline:
+    pay the funder the account's remaining balance (i2). Every branch
+    assigns all three leg outputs, and the clause reads i26/i5/i2 — a
+    clause that reads no input stream cannot be stepped by the policy
+    worker at all.
+    """
+    def no_legs():
+        return ("((o30[t]:bv[64] = { 0 }:bv[64]) "
+                "&& (o31[t]:bv[64] = { 0 }:bv[64]) "
+                "&& (o32[t]:bv[64] = { 0 }:bv[64]))")
+
+    def one_leg(idx, amount_expr):
+        return ("((o30[t]:bv[64] = { 1 }:bv[64]) "
+                "&& (o31[t]:bv[64] = { " + str(idx) + " }:bv[64]) "
+                "&& (o32[t]:bv[64] = " + amount_expr + "))")
+
+    draw = ("((i26[t]:bv[64] < { 500 }:bv[64]) "
+            "? " + one_leg(bob_idx, "({ 500 }:bv[64] - i26[t]:bv[64])")
+            + " : " + no_legs() + ")")
+    refund = ("((i2[t]:bv[64] < { 1 }:bv[64]) "
+              "? " + no_legs()
+              + " : " + one_leg(funder_idx, "i2[t]:bv[64]") + ")")
+    return ("((i5[t]:bv[64] < { " + str(DEADLINE) + " }:bv[64]) "
+            "? " + draw + " : " + refund + ")")
+
+
 def main():
     import config
     import chain_state
     import db
     import tau_manager
     import tau_native
-    from bls_keys import SK_ALICE, SK_CAROL, sign_payload
+    from bls_keys import SK_CAROL, sign_payload
     from block import Block
     import block as block_mod
     from commands import createblock, sendtx
-    from consensus.grants import GrantEntry
-    from consensus.standing_payments import SCHEDULE_WEEKLY
+    from consensus.payout_rules import FORM_TAU_RULE, PayoutRuleEntry
 
-    GRANT_ID = GrantEntry(
-        funder_pubkey=FUNDER, beneficiary_pubkey=BENEFICIARY,
-        total_amount=5000, release_per_period=500,
-        schedule_kind=SCHEDULE_WEEKLY, signed_day=0,
-        start_ts=T0, deadline_ts=DEADLINE,
-        locked_until_ts=0, window_start_ts=0, window_end_ts=0,
-        inactivity_seconds=0, version=1,
-    ).grant_id
+    RECIPIENTS = sorted([BOB, FUNDER])
+    CLAUSE = grant_clause(RECIPIENTS.index(BOB), RECIPIENTS.index(FUNDER))
 
     # --- Boot: the single-node native suite's setUp, on this child's own DB.
     iface = tau_native.TauInterface(GENESIS_TAU)
@@ -195,8 +234,10 @@ def main():
     db.init_db()
     chain_state.load_genesis("data/genesis.json")
     db.clear_mempool()
-    chain_state._balances[FUNDER] = 100000
-    chain_state._balances[SUBMITTER] = 1000
+    chain_state._balances[OWNER] = 5000  # stocked by the funder
+    chain_state._balances[EXECUTOR] = 100000
+    chain_state._balances[FUNDER] = 0
+    chain_state._balances[BOB] = 0
     chain_state._lifecycle_manager.active_validators = {config.MINER_PUBKEY.lower()}
     chain_state._lifecycle_manager.recompute_approval_threshold()
     tau_manager.tau_direct_interface = iface
@@ -226,15 +267,19 @@ def main():
     def head_dict():
         return db.get_canonical_head_block()
 
-    def grant_view():
-        book = chain_state._lifecycle_manager.grants
-        if book.grant_count() == 0:
+    def payout_view():
+        book = chain_state._lifecycle_manager.payout_rules
+        entry = book.get(OWNER)
+        if entry is None:
             return None
-        head = head_dict()
         return {
-            "accounting": book.accounting(GRANT_ID),
-            "status": book.status(GRANT_ID, int(head["header"]["timestamp"])),
-            "held_total": book.held_total(),
+            "rule_id": entry.rule_id.hex(),
+            "period_totals": {
+                str(i): book.period_total(entry.rule_id, i)
+                for i in range(7)},
+            "settled": sorted(
+                s.settlement_id.hex()
+                for s in book.settlements_for(entry.rule_id)),
         }
 
     def checkpoint(label):
@@ -244,10 +289,10 @@ def main():
             "head_hash": head["block_hash"],
             "state_hash": head["header"]["state_hash"],
             "balances": {a: chain_state._balances.get(a, 0)
-                         for a in (FUNDER, BENEFICIARY, SUBMITTER)},
+                         for a in (OWNER, BOB, FUNDER, EXECUTOR)},
             "sequences": {a: chain_state.get_sequence_number(a)
-                          for a in (FUNDER, SUBMITTER)},
-            "grant": grant_view(),
+                          for a in (OWNER, EXECUTOR)},
+            "payout": payout_view(),
         }
 
     def dry_run(candidate):
@@ -311,19 +356,11 @@ def main():
                     pass
 
     def record_verdict(label, res):
-        events = []
-        md = res.next_snapshot.metadata or {}
-        for e in (md.get("grant_events") or []):
-            events.append({
-                "action": e.get("action"), "amount": e.get("amount"),
-                "funder": e.get("funder_pubkey"),
-                "grant_id": e.get("grant_id")})
         result["verdicts"][label] = {
             "accepted": sorted(res.accepted_tx_ids),
             "invalid": sorted(res.invalid_tx_ids),
             "reasons": {o.tx_id: o.reason for o in (res.outcomes or [])},
             "next_state_hash": res.next_snapshot.state_hash,
-            "grant_events": events,
         }
 
     def build_block(txs, ts, label):
@@ -379,41 +416,38 @@ def main():
         db.clear_mempool()
         return candidate
 
-    def create_tx():
-        return sign_payload({
-            "tx_id": "pr5-case5-create",
-            "tx_type": "create_grant",
-            "sender_pubkey": FUNDER,
-            "sequence_number": chain_state.get_sequence_number(FUNDER),
-            "expiration_time": TX_EXPIRY,
-            "expire_at_height": 5000,
-            "fee_limit": "1000",
-            "grant_beneficiary_pubkey": BENEFICIARY,
-            "grant_total_amount": 5000,
-            "grant_release_per_period": 500,
-            "grant_schedule": "weekly",
-            "grant_signed_day": 0,
-            "grant_start_ts": T0,
-            "grant_deadline_ts": DEADLINE,
-            "grant_locked_until_ts": 0,
-            "grant_window_start_ts": 0,
-            "grant_window_end_ts": 0,
-            "grant_inactivity_seconds": 0,
-            "grant_version": 1,
-        }, SK_ALICE)
+    def rule_id_hex():
+        entry = chain_state._lifecycle_manager.payout_rules.get(OWNER)
+        return entry.rule_id.hex()
 
-    def draw_tx(n):
+    def execute_tx(tx_id, sid_hex, base):
         return sign_payload({
-            "tx_id": "pr5-case5-draw-" + str(n),
-            "tx_type": "draw_grant",
-            "sender_pubkey": SUBMITTER,
-            "sequence_number": chain_state.get_sequence_number(SUBMITTER),
+            "tx_id": tx_id,
+            "tx_type": "execute_payout_rule",
+            "sender_pubkey": EXECUTOR,
+            "sequence_number": chain_state.get_sequence_number(EXECUTOR),
             "expiration_time": TX_EXPIRY,
             "expire_at_height": 5000,
             "fee_limit": "50",
-            "grant_id": GRANT_ID.hex(),
-            "grant_draw_amount": 500,
+            "payout_rule_id": rule_id_hex(),
+            "payout_settlement_id": sid_hex,
+            "payout_base_amount": base,
         }, SK_CAROL)
+
+    # --- Shared: the identical entry, installed with the book's own
+    # install call on BOTH children (see the module docstring for why
+    # not an install transaction: the case's exact numbers). The
+    # install's recorded moment is anchor + 2 weeks + 3 days —
+    # mid-week-2 of the anchored grid, week 0 of the install grid.
+    checkpoint("boot")
+    entry = PayoutRuleEntry(
+        owner_pubkey=OWNER, recipients=tuple(RECIPIENTS), legs=(),
+        max_per_execution=3500, max_per_period=3500,
+        period_seconds=WEEK, period_anchor_ts=INSTALL_TS, version=1,
+        form=FORM_TAU_RULE, clause_text=CLAUSE, periods_from_ts=T0,
+    )
+    chain_state._lifecycle_manager.payout_rules.install(entry, INSTALL_TS)
+    checkpoint("install")
 
     if ROLE == "proposer":
         events = []
@@ -422,45 +456,48 @@ def main():
             events.append({"op": "block", "label": label,
                            "block": candidate.to_dict()})
 
-        checkpoint("boot")
-
-        # The grant opens at the anchor: the funder's create is admitted
-        # through the real sendtx path and custodies 5,000 via the seam.
-        tx = queue_and_fetch(create_tx(), "create")
-        candidate = produce("create", [tx], T0)
-        emit("create", candidate)
-        checkpoint("create")
-
-        # Weeks 1-3: one 500 draw each. Draw 1 is admitted against the
-        # wall-clock-side tip; draws 2 and 3 first advance the chain
-        # clock with an empty schedule block, because admission reads
-        # the tip (max of tip timestamp and wall clock).
-        tx = queue_and_fetch(draw_tx(1), "draw1")
-        candidate = produce("draw1", [tx], T0 + 10)
+        # Draw 1 in anchored week 2.
+        tx = queue_and_fetch(execute_tx("fix1a-draw-1", "11" * 32, 500), "draw1")
+        candidate = produce("draw1", [tx], INSTALL_TS + 10)
         emit("draw1", candidate)
         checkpoint("draw1")
 
-        candidate = produce("advance2", [], T0 + WEEK + 10)
-        emit("advance2", candidate)
-        checkpoint("advance2")
+        # A second execution in the same anchored week, force-included
+        # with admission bypassed: the clause computes no leg (i26
+        # already reads 500 for this week), so it settles nothing.
+        tx = execute_tx("fix1a-draw-1b", "22" * 32, 500)
+        candidate = produce("draw1b", [tx], INSTALL_TS + 20)
+        emit("draw1b", candidate)
+        checkpoint("draw1b")
 
-        tx = queue_and_fetch(draw_tx(2), "draw2")
-        candidate = produce("draw2", [tx], T0 + WEEK + 10)
-        emit("draw2", candidate)
-        checkpoint("draw2")
-
-        candidate = produce("advance3", [], T0 + 2 * WEEK + 10)
+        # Advance the chain clock into anchored week 3, then draw 2 —
+        # a timestamp the install grid would still call week 0.
+        candidate = produce("advance3", [], T0 + 3 * WEEK + 5)
         emit("advance3", candidate)
         checkpoint("advance3")
 
-        tx = queue_and_fetch(draw_tx(3), "draw3")
-        candidate = produce("draw3", [tx], T0 + 2 * WEEK + 10)
+        tx = queue_and_fetch(execute_tx("fix1a-draw-2", "33" * 32, 500), "draw2")
+        candidate = produce("draw2", [tx], T0 + 3 * WEEK + 10)
+        emit("draw2", candidate)
+        checkpoint("draw2")
+
+        candidate = produce("advance4", [], T0 + 4 * WEEK + 5)
+        emit("advance4", candidate)
+        checkpoint("advance4")
+
+        tx = queue_and_fetch(execute_tx("fix1a-draw-3", "44" * 32, 500), "draw3")
+        candidate = produce("draw3", [tx], T0 + 4 * WEEK + 10)
         emit("draw3", candidate)
         checkpoint("draw3")
 
-        # The deadline block carries no transaction at all: the sweep
-        # refunds the unspent remainder to the funder.
-        candidate = produce("refund", [], DEADLINE)
+        # Past the deadline the clause's refund leg is selected: one
+        # execution with base 1 returns the whole remainder.
+        candidate = produce("advance5", [], T0 + 5 * WEEK + 5)
+        emit("advance5", candidate)
+        checkpoint("advance5")
+
+        tx = queue_and_fetch(execute_tx("fix1a-refund", "55" * 32, 1), "refund")
+        candidate = produce("refund", [tx], T0 + 5 * WEEK + 10)
         emit("refund", candidate)
         checkpoint("refund")
 
@@ -470,7 +507,6 @@ def main():
     else:
         with open(EVENTS_PATH) as fh:
             events = json.load(fh)["events"]
-        checkpoint("boot")
         for ev in events:
             if ev["op"] != "block":
                 raise RuntimeError("unknown op " + ev["op"])
@@ -489,13 +525,12 @@ except Exception:
 
 def _child_src() -> str:
     return _CHILD_SRC % {
-        "FUNDER": FUNDER, "BENEFICIARY": BENEFICIARY,
-        "SUBMITTER": SUBMITTER,
+        "FUNDER": FUNDER, "BOB": BOB, "EXECUTOR": EXECUTOR, "OWNER": OWNER,
     }
 
 
 def _run_child(tmp_path, role, t0):
-    script = tmp_path / f"grants_twonode_child_{role}.py"
+    script = tmp_path / f"payout_twonode_child_{role}.py"
     script.write_text(_child_src())
     env = dict(os.environ)
     env["TWONODE_ROLE"] = role
@@ -508,7 +543,7 @@ def _run_child(tmp_path, role, t0):
         [str(_REPO), str(_REPO / "tests"), env.get("PYTHONPATH", "")])
     proc = subprocess.run(
         [sys.executable, str(script)],
-        capture_output=True, text=True, env=env, cwd=str(_REPO), timeout=600,
+        capture_output=True, text=True, env=env, cwd=str(_REPO), timeout=900,
     )
     out_file = tmp_path / f"twonode_{role}.json"
     assert out_file.exists(), (
@@ -526,10 +561,12 @@ def _assert_child_ok(proc, record, role):
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
 
 
-def test_grant_case5_two_node_refund_parity(tmp_path):
-    """Named case 5 on two nodes: a 5,000 grant releasing 500/week is
-    drawn 500 in each of weeks 1-3 (1,500 total) and the deadline block's
-    sweep refunds exactly 3,500 to the funder — identically on the
+def test_case5_tau_form_periods_from_two_node_parity(tmp_path):
+    """Named case 5, Tau-clause form, periods_from set, on two nodes:
+    a 5,000 grant whose clause pays 500 per anchored week is installed
+    two weeks and three days after its signed anchor; three weekly
+    draws settle (1,500), a same-week repeat settles nothing, and the
+    post-deadline execution refunds exactly 3,500 — identically on the
     proposer that produced the blocks and the follower that only
     ingested them, at every checkpoint, on the real engine."""
     import time
@@ -539,36 +576,43 @@ def test_grant_case5_two_node_refund_parity(tmp_path):
     proc_f, foll = _run_child(tmp_path, "follower", t0)
     _assert_child_ok(proc_f, foll, "follower")
 
-    # Every block ingested cleanly on both nodes.
-    for label, ok in sorted(foll["ingest"].items()):
-        assert ok, f"follower failed to ingest {label}"
-    for label, ok in sorted(prop["ingest"].items()):
-        assert ok, f"proposer failed to ingest {label}"
+    # Every block ingested cleanly on both nodes. The one stated
+    # exception is the same-week repeat's block: whether a block
+    # carrying a settles-nothing execution is ingested or refused is
+    # the engine's business — parity requires only that BOTH nodes did
+    # the same thing with it, which is asserted instead.
+    assert prop["ingest"].keys() == foll["ingest"].keys()
+    for label in prop["ingest"]:
+        assert prop["ingest"][label] == foll["ingest"][label], (
+            f"ingest {label} diverges: proposer={prop['ingest'][label]}"
+            f" follower={foll['ingest'][label]}")
+        if label != "draw1b":
+            assert prop["ingest"][label], f"block {label} not ingested"
 
-    # Admission on the proposer accepted the create and all three draws
-    # through the real sendtx path.
-    for label in ("create", "draw1", "draw2", "draw3"):
+    # Admission on the proposer accepted all three draws and the
+    # refund through the real sendtx path.
+    for label in ("draw1", "draw2", "draw3", "refund"):
         assert prop["admissions"][label]["ok"] is True, (
             f"{label} admission: {prop['admissions'][label]}")
 
-    # Both nodes' own apply verdicts agree on every block, and the grant
+    # Both nodes' own apply verdicts agree on every block; the admitted
     # transactions were accepted — never invalid — on both.
     assert prop["verdicts"].keys() == foll["verdicts"].keys()
     for label in prop["verdicts"]:
         assert prop["verdicts"][label] == foll["verdicts"][label], (
             f"verdict {label} diverges:\nproposer={prop['verdicts'][label]}"
             f"\nfollower={foll['verdicts'][label]}")
-    for label, tx_id in (("create", "pr5-case5-create"),
-                         ("draw1", "pr5-case5-draw-1"),
-                         ("draw2", "pr5-case5-draw-2"),
-                         ("draw3", "pr5-case5-draw-3")):
+    for label, tx_id in (("draw1", "fix1a-draw-1"),
+                         ("draw2", "fix1a-draw-2"),
+                         ("draw3", "fix1a-draw-3"),
+                         ("refund", "fix1a-refund")):
         verdict = prop["verdicts"][label]
         assert tx_id in verdict["accepted"], (label, verdict)
         assert verdict["invalid"] == [], (label, verdict)
 
     # The checkpoint streams are identical at every point of the
     # scenario: same height, head hash, state hash, balances, sequences
-    # and grant accounting on both nodes.
+    # and payout accounting on both nodes.
     assert prop["checkpoints"].keys() == foll["checkpoints"].keys()
     for label in prop["checkpoints"]:
         assert prop["checkpoints"][label] == foll["checkpoints"][label], (
@@ -577,56 +621,58 @@ def test_grant_case5_two_node_refund_parity(tmp_path):
 
     cp = prop["checkpoints"]
 
-    # Creation custodied the full 5,000 in the book; the funder is down
-    # by the total plus exactly the create's fee, the beneficiary
-    # untouched.
-    assert cp["create"]["grant"] == {
-        "accounting": {"principal": 5000, "drawn": 0, "held": 5000,
-                       "refunded": 0},
-        "status": "active", "held_total": 5000}, cp["create"]["grant"]
-    create_cost = (cp["boot"]["balances"][FUNDER]
-                   - cp["create"]["balances"][FUNDER])
-    assert create_cost > 5000, f"create cost {create_cost} (custody + fee)"
-    assert (cp["create"]["balances"][BENEFICIARY]
-            == cp["boot"]["balances"][BENEFICIARY])
+    # The install recorded the rule; nothing paid yet.
+    assert cp["install"]["payout"]["period_totals"] == {
+        str(i): 0 for i in range(7)}, cp["install"]["payout"]
+    assert cp["install"]["payout"]["settled"] == []
 
-    # Each draw moved exactly 500 to the beneficiary; the schedule
-    # blocks moved nothing.
-    prev = "create"
-    for label in ("draw1", "draw2", "draw3"):
-        delta = (cp[label]["balances"][BENEFICIARY]
-                 - cp[prev]["balances"][BENEFICIARY])
-        assert delta == 500, f"{label}: beneficiary moved {delta}, not 500"
-        prev = label
-        if label == "draw1":
-            assert cp["advance2"]["balances"] == cp["draw1"]["balances"]
-        if label == "draw2":
-            assert cp["advance3"]["balances"] == cp["draw2"]["balances"]
-    assert (cp["draw3"]["balances"][BENEFICIARY]
-            - cp["boot"]["balances"][BENEFICIARY]) == 1500
-    assert cp["draw3"]["grant"]["accounting"] == {
-        "principal": 5000, "drawn": 1500, "held": 3500, "refunded": 0}
+    # Draw 1 settles 500 to Bob, recorded under ANCHORED period 2 —
+    # the install grid would have called this period 0.
+    totals = cp["draw1"]["payout"]["period_totals"]
+    assert totals["2"] == 500, totals
+    assert totals["0"] == 0, totals
+    assert (cp["draw1"]["balances"][BOB] - cp["install"]["balances"][BOB]) == 500
+    assert (cp["install"]["balances"][OWNER]
+            - cp["draw1"]["balances"][OWNER]) == 500
 
-    # The deadline block: the sweep refunded exactly 3,500 to the
-    # funder — the delta is the remainder itself, to the unit, on both
-    # nodes (the streams are equal, so the follower's delta is the same
-    # number) — and both nodes' apply of that block recorded the refund
-    # event.
+    # The same-week repeat settles nothing: Bob, the grant account and
+    # the funder are exactly where draw 1 left them, and the period
+    # totals and settlement list do not move (the executor's own fee
+    # handling, whatever it is, is identical on both nodes — the
+    # streams above are equal).
+    for acct in (BOB, OWNER, FUNDER):
+        assert (cp["draw1b"]["balances"][acct]
+                == cp["draw1"]["balances"][acct]), acct
+    assert cp["draw1b"]["payout"]["period_totals"] == totals
+    assert cp["draw1b"]["payout"]["settled"] == cp["draw1"]["payout"]["settled"]
+
+    # The schedule blocks move nothing.
+    assert cp["advance3"]["balances"] == cp["draw1b"]["balances"]
+    assert cp["advance4"]["balances"] == cp["draw2"]["balances"]
+    assert cp["advance5"]["balances"] == cp["draw3"]["balances"]
+
+    # Draws 2 and 3 settle 500 each, under anchored periods 3 and 4.
+    totals = cp["draw3"]["payout"]["period_totals"]
+    assert totals["2"] == 500 and totals["3"] == 500 and totals["4"] == 500, totals
+    assert totals["0"] == 0 and totals["1"] == 0, totals
+    assert (cp["draw3"]["balances"][BOB] - cp["boot"]["balances"][BOB]) == 1500
+    assert cp["draw3"]["balances"][OWNER] == 3500
+
+    # The refund execution returns exactly 3,500 to the funder — the
+    # delta is the remainder itself, to the unit — recorded under
+    # anchored period 5, and the grant account ends empty.
     refund_delta = (cp["refund"]["balances"][FUNDER]
                     - cp["draw3"]["balances"][FUNDER])
     assert refund_delta == 3500, f"refund moved {refund_delta}, not 3500"
-    for record in (prop, foll):
-        events = record["verdicts"]["refund"]["grant_events"]
-        assert len(events) == 1, events
-        assert events[0]["action"] == "refunded", events
-        assert events[0]["amount"] == 3500, events
-        assert events[0]["funder"] == FUNDER, events
+    assert cp["refund"]["balances"][OWNER] == 0
+    assert cp["refund"]["payout"]["period_totals"]["5"] == 3500
+    assert cp["refund"]["payout"]["settled"] == sorted(
+        ["11" * 32, "33" * 32, "44" * 32, "55" * 32])
 
-    # Final state: the grant is fully settled — nothing held, nothing
-    # left to draw — at height 7 (genesis + create + 3 draws + 2
-    # schedule blocks + the deadline block).
-    assert cp["refund"]["grant"] == {
-        "accounting": {"principal": 5000, "drawn": 1500, "held": 0,
-                       "refunded": 3500},
-        "status": "refunded", "held_total": 0}, cp["refund"]["grant"]
-    assert cp["refund"]["height"] == 7, cp["refund"]
+    # The refund block closes the stream two heights after draw 3
+    # (the deadline-advance block, then the refund block itself) —
+    # stated relatively so the assertion does not depend on whether
+    # the same-week repeat's block was ingested or refused identically
+    # on both nodes (the streams above pin that it was the SAME on
+    # both, which is the parity this file exists to prove).
+    assert cp["refund"]["height"] == cp["draw3"]["height"] + 2, cp["refund"]
