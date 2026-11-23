@@ -201,6 +201,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_period_seconds"] = payload.get("payout_period_seconds")
         signing_dict["payout_period_anchor_ts"] = payload.get("payout_period_anchor_ts")
         signing_dict["payout_version"] = payload.get("payout_version")
+        # The base source fixes where execution bases come from (FIX
+        # 1-B): a proposer who could rewrite it could turn a
+        # receipt-based rule back into a submitted-base one.
+        signing_dict["payout_base_source"] = payload.get("payout_base_source")
     elif tx_type == TX_TYPE_REMOVE_PAYOUT_RULE:
         # Nothing beyond the signer's identity (sender_pubkey is always
         # signed): a removal names the signer's own rule, and there is no
@@ -214,6 +218,10 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["payout_rule_id"] = payload.get("payout_rule_id")
         signing_dict["payout_settlement_id"] = payload.get("payout_settlement_id")
         signing_dict["payout_base_amount"] = payload.get("payout_base_amount")
+        # The receipt an execution names (FIX 1-B) is signed: it picks
+        # the recorded sale this execution settles, so it binds like the
+        # settlement id does.
+        signing_dict["payout_receipt_id"] = payload.get("payout_receipt_id")
     elif tx_type == TX_TYPE_CREATE_GRANT:
         # Every field that fixes the grant is signed: the beneficiary, the
         # total, the release schedule, the deadline and every time

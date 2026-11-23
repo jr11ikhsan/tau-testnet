@@ -603,7 +603,8 @@ class TipAdmissionView:
 
         row = next(r for r in book.rows() if r[0] == entry.rule_id)
         (rule_id, owner, recipients, legs, max_exec, max_period,
-         period_seconds, anchor, version, period_totals) = row
+         period_seconds, anchor, version, period_totals) = row[:10]
+        base_source = int(row[10]) if len(row) > 10 else 0
         ts = self.next_block_timestamp
         period = period_index_at(entry, ts)
         return {
@@ -619,6 +620,7 @@ class TipAdmissionView:
             "period_seconds": period_seconds,
             "period_anchor_ts": anchor,
             "version": version,
+            "base_source": base_source,
             "period_totals": [
                 {"period_index": i, "total": t} for i, t in period_totals
             ],
@@ -632,8 +634,23 @@ class TipAdmissionView:
                     "base_amount": s.base_amount,
                     "total": s.total,
                     "execution_ts": s.execution_ts,
+                    "receipt_id": s.receipt_id.hex() if s.receipt_id else "",
                 }
                 for s in book.settlements_for(entry.rule_id)
+            ],
+            # The owner's recorded receipts (FIX 1-B), with consumption
+            # read from the full book — a receipt consumed under an
+            # earlier rule version is consumed here too, so the rebuilt
+            # one-entry book admission uses answers identically.
+            "receipts": [
+                {
+                    "receipt_id": r.receipt_id.hex(),
+                    "sender_pubkey": r.sender_pubkey,
+                    "amount": r.amount,
+                    "recorded_ts": r.recorded_ts,
+                    "consumed": book.receipt_consumed(r.receipt_id),
+                }
+                for r in book.receipts_for(owner)
             ],
         }
 
