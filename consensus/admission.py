@@ -307,8 +307,10 @@ def screen_user_rule_text(
             f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
             f"without a sender scope: it would apply to every account on the "
             f"network. Guard the rule on your own identity — reference i12 "
-            f"(sender pubkey) or i3 (from address), e.g. "
-            f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
+            f"(sender pubkey) or i3 (from address), and assign the stream on "
+            f"both branches, e.g. "
+            f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) ? "
+            f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24] : "
             f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
             "unscoped_user_rule",
             "UNSCOPED_USER_RULE",

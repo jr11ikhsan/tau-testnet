@@ -293,3 +293,22 @@ def test_admission_and_apply_reach_the_same_verdict(row, context):
     assert (not admitted.is_valid) == refused_at_apply, (admitted.code, admitted.error)
     if refused_at_apply:
         assert REASON_TO_CODE[_outcome(result).reason] == admitted.code
+
+
+# --- B03FIX4 S-1: the unscoped-rule hint must not teach the trap -----------
+
+def test_unscoped_rule_hint_suggests_a_two_branch_assignment():
+    """B03FIX4 S-1 (PR #165, commit a161df5): an o5/o8 clause in implication
+    form leaves the stream unconstrained where the guard is false, and the
+    engine materializes 0 — for o5 that is a block. The UNSCOPED_USER_RULE
+    hint used to suggest exactly that shape; it must now suggest a ternary
+    that assigns the stream on both branches."""
+    admitted = _admit(_tx(UNSCOPED_O8), "slots_off")
+    assert not admitted.is_valid
+    assert admitted.code == "UNSCOPED_USER_RULE"
+    hint = str(admitted.error)
+    example = hint.split("e.g.", 1)[-1]
+    assert "->" not in example, hint
+    assert "?" in example and ":" in example, hint
+    # The example assigns the shared stream on both branches of the ternary.
+    assert example.count("o8[t]:bv[24]") >= 2, hint

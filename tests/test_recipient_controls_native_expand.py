@@ -1159,5 +1159,165 @@ class TestHoldCapChangePointsNative(_RecipientNativeHarness,
         self.assertFalse(blocked, info)
 
 
+# --- B03FIX4 S-1: the a161df5 lesson, pinned on the real engine -----------
+#
+# An o5 clause in implication form leaves o5 unconstrained where the guard
+# is false, and the engine materializes 0 — a block. The shipped
+# templates (the CLI compose functions, the docs, every body in this
+# file) are all ternary; this pair proves why, on the real evaluator.
+IMPLICATION_BODY = (
+    "(i4[t]:bv[384] = { #x" + RECIPIENT + " }:bv[384]) -> "
+    "(o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+TERNARY_TWIN_BODY = (
+    "(i4[t]:bv[384] = { #x" + RECIPIENT + " }:bv[384]) "
+    "? (o5[t]:bv[24] = { #x000001 }:bv[24]) "
+    ": (o5[t]:bv[24] = { #x000001 }:bv[24])"
+)
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestImplicationTrapNative(_RecipientNativeHarness, unittest.TestCase):
+    """B03FIX4 S-1: the author's intent in both bodies is the same —
+    'allow payments to RECIPIENT'. The implication form also silently
+    blocks every other recipient; the ternary twin does not."""
+
+    def test_implication_form_blocks_the_unmentioned_recipient(self):
+        self._install_clause(SENDER, IMPLICATION_BODY)
+        self._warm()  # SENDER -> RECIPIENT: guard true, o5 = 1
+        res = self._queue_transfer(SENDER, STRANGER, 100, SK_MALLORY)
+        self.assertFalse(
+            res["ok"],
+            f"implication form admitted the unmentioned recipient: {res}")
+        self.assertIn("sender's own policy clause", res["message"], res)
+        self.assertEqual(db.get_mempool_txs(), [])
+
+    def test_ternary_twin_admits_the_unmentioned_recipient(self):
+        self._install_clause(SENDER, TERNARY_TWIN_BODY)
+        self._warm()  # SENDER -> RECIPIENT: guard true, o5 = 1
+        bal_before = chain_state._balances.get(STRANGER, 0)
+        self._transfer(SENDER, STRANGER, 100, SK_MALLORY)
+        self.assertEqual(
+            chain_state._balances.get(STRANGER, 0) - bal_before, 100)
+
+
+class _FixedClock:
+    """A clock for createblock only: time() frozen at the given timestamp,
+    monotonic() real. Patching createblock.time (not the global time
+    module) keeps every other module's clock honest, so block validation
+    still judges the stamped block with the real wall clock."""
+
+    def __init__(self, fixed):
+        self._fixed = fixed
+
+    def time(self):
+        return self._fixed
+
+    def monotonic(self):
+        return time.monotonic()
+
+
+@pytest.mark.skipif(not _NATIVE_TAU, reason="native tau module not available")
+class TestAdmissionApplyHoldSkewNative(_RecipientNativeHarness,
+                                       unittest.TestCase):
+    """B03FIX4 S-2: the hold a park is judged on is measured against two
+    clocks — admission uses next_block_timestamp = max(tip, now), apply
+    uses the carrying block's header timestamp. The protocol bounds the
+    block clock to now + 120 (future drift) and to >= the parent
+    timestamp (monotone), so a past skew is bounded by the parent, not
+    by 120 — the tests below pin both directions at the named 120-second
+    bound and at the exact 600-second cap.
+
+    The exact 600/601 boundary is pinned deterministically by preflight
+    (test_preflight_seconds_hold_600_at_cap_admitted /
+    test_preflight_seconds_hold_601_refused_with_cap_600); the real-park
+    tests here prove the boundary park travels admission -> apply, with
+    the wall-clock fuzz of +-1s documented where it applies. The
+    over-cap real park uses a 5-second margin for the same reason."""
+
+    def setUp(self):
+        super().setUp()
+        self._install_clause(RECIPIENT, CAP_BODY)
+
+    def _mine_with_block_time(self, fixed_ts, expected_txs=None,
+                              allow_empty=False):
+        with patch.object(createblock, "time", _FixedClock(fixed_ts)):
+            block_res = createblock.create_block_from_mempool(
+                allow_empty=allow_empty)
+        if expected_txs is not None:
+            self.assertEqual(
+                len(block_res.get("transactions", [])), expected_txs,
+                block_res)
+        return block_res
+
+    def _warm_with_block_time(self, fixed_ts):
+        res = self._queue_transfer(SENDER, RECIPIENT, 1, SK_ALICE)
+        self.assertTrue(res["ok"], f"warm transfer refused: {res}")
+        self._mine_with_block_time(fixed_ts, expected_txs=1)
+
+    def test_time_park_exactly_at_the_cap_settles(self):
+        self._warm()
+        escrow_before = self._escrow_total()
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_time=int(time.time()) + 600)
+        self.assertTrue(res["ok"], f"at-cap park refused at admission: {res}")
+        self._mine(expected_txs=1)
+        self.assertEqual(self._escrow_total() - escrow_before, 100)
+
+    def test_time_park_over_the_cap_is_refused_at_admission_and_never_settles(self):
+        self._warm()
+        escrow_before = self._escrow_total()
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_time=int(time.time()) + 605)
+        self.assertFalse(res["ok"], f"over-cap park admitted: {res}")
+        self.assertIn("RECIPIENT_MAX_HOLD", str(res))
+        self.assertEqual(
+            res["details"]["recipient_policy"]["max_hold_seconds"], 600, res)
+        self.assertEqual(db.get_mempool_txs(), [])
+        self.assertEqual(self._escrow_total(), escrow_before)
+
+    def test_time_park_at_the_cap_refused_at_apply_when_the_block_clock_lags_120s(self):
+        """The past-skew direction. The carrying block may legally carry
+        its parent's timestamp — here 120 s behind the admission
+        estimate. The hold then measures 720 s at apply against the
+        600 s cap: admission accepts, apply refuses. The divergence runs
+        toward refusal, never toward a settlement the recipient's rule
+        forbids — measured, not asserted."""
+        t0 = int(time.time()) - 120
+        self._warm_with_block_time(t0)
+        now = int(time.time())
+        escrow_before = self._escrow_total()
+        bal_sender = chain_state._balances.get(SENDER, 0)
+        seq_sender = chain_state.get_sequence_number(SENDER)
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_time=now + 600)
+        self.assertTrue(res["ok"], f"at-cap park refused at admission: {res}")
+        block_res = self._mine_with_block_time(t0, expected_txs=0,
+                                               allow_empty=True)
+        self.assertEqual(self._escrow_total(), escrow_before)
+        self.assertEqual(chain_state._balances.get(SENDER, 0), bal_sender)
+        self.assertEqual(chain_state.get_sequence_number(SENDER), seq_sender)
+        # The 720-second hold the apply clock measured, judged
+        # deterministically through the same evaluation preflight runs:
+        ev = self._preflight(720, "seconds")
+        self.assertFalse(ev["admitted"], ev)
+        self.assertEqual(ev["max_hold_seconds"], 600, ev)
+
+    def test_time_park_at_the_cap_still_settles_when_the_block_clock_leads_120s(self):
+        """The future-skew direction, at the protocol's +120 s bound: the
+        carrying block's timestamp runs 120 s ahead, so the hold measures
+        480 s at apply. Admission accepted at 600; apply still accepts."""
+        self._warm()
+        escrow_before = self._escrow_total()
+        now = int(time.time())
+        res = self._park(SENDER, RECIPIENT, 100, SK_ALICE,
+                         release_at_time=now + 600)
+        self.assertTrue(res["ok"], f"at-cap park refused at admission: {res}")
+        future = int(time.time()) + 120
+        self._mine_with_block_time(future, expected_txs=1)
+        self.assertEqual(self._escrow_total() - escrow_before, 100)
+
+
 if __name__ == "__main__":
     unittest.main()

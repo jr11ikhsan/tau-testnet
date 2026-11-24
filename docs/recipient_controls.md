@@ -45,8 +45,8 @@ is the neutral default for recipients without a policy.
 always (
   (i16[t] = {0}:bv[64]) ? <existing outbound body, or o5 = allow>
 : (i16[t] = {1}:bv[64]) ? (sender ∈ {A, B} on i3 ? o5 = allow : o5 = block)
-: (i16[t] = {2}:bv[64]) ? ((sender ∈ {A, B}) && i17[t] ≤ 600 ? allow : block)
-:                          ((sender ∈ {A, B}) && i17[t] ≤ 10  ? allow : block) ).
+: (i16[t] = {2}:bv[64]) ? ((sender ∈ {A, B}) && i17[t] ≤ 600 ? o5 = allow : o5 = block)
+:                          ((sender ∈ {A, B}) && i17[t] ≤ 10  ? o5 = allow : o5 = block) ).
 ```
 
 A clause that reads `i17` but never reads `i16` is **refused at deploy**:
