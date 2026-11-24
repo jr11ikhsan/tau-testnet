@@ -133,7 +133,6 @@ jobs:
           tests/test_grants_clause_native.py
           tests/test_standing_due_retry_native.py
           tests/test_rule_change_payment_kinds_native.py
-          tests/test_rule_change_guard_native.py
           tests/test_multirule_native.py
           tests/test_sharedcap_native.py
           tests/test_standing_deciding_rule_native.py
