@@ -62,6 +62,7 @@ from consensus.grants import (
     parse_set_grant_shared_cap,
 )
 from consensus.payout_rules import (
+    FORM_TAU_DECIDING_RULE as PAYOUT_FORM_TAU_DECIDING_RULE,
     FORM_TAU_RULE,
     TX_TYPE_EXECUTE_PAYOUT_RULE,
     TX_TYPE_INSTALL_PAYOUT_RULE,
@@ -69,6 +70,7 @@ from consensus.payout_rules import (
     PayoutRuleBook,
     PayoutRuleShapeError,
     decode_clause_legs,
+    decode_rule_outputs as decode_payout_rule_outputs,
     parse_execute_payout_rule,
     parse_install_payout_rule,
     parse_remove_payout_rule,
@@ -86,12 +88,14 @@ from consensus.receive_routes import (
 )
 from consensus.standing_payments import (
     FORM_TAU_CLAUSE as STANDING_FORM_TAU_CLAUSE,
+    FORM_TAU_DECIDING_RULE as STANDING_FORM_TAU_DECIDING_RULE,
     TX_TYPE_CANCEL_STANDING_PAYMENT,
     TX_TYPE_CREATE_STANDING_PAYMENT,
     TX_TYPE_EXECUTE_STANDING_PAYMENT,
     StandingPaymentBook,
     StandingPaymentShapeError,
     decode_clause_legs as decode_standing_clause_legs,
+    decode_rule_outputs as decode_standing_rule_outputs,
     parse_cancel_standing_payment,
     parse_create_standing_payment,
     parse_execute_standing_payment,
@@ -2067,17 +2071,21 @@ def validate_execute_standing_payment_payload(
     ts = tip_view.next_block_timestamp
     balance = tip_view.get_balance(row["payer_pubkey"])
     clause_legs = None
+    clause_verdict = None
+    clause_periods = None
     entry = book.get(auth_id)
-    if entry is not None and entry.form == STANDING_FORM_TAU_CLAUSE:
+    if entry is not None and entry.form in (
+        STANDING_FORM_TAU_CLAUSE,
+        STANDING_FORM_TAU_DECIDING_RULE,
+    ):
         from consensus import sender_policy
 
         outputs, detail = sender_policy.clause_outputs(
             entry.clause_text,
-            standing_clause_inputs(
+            book.clause_inputs_for(
                 entry,
                 sender if isinstance(sender, str) else "",
                 ts, balance,
-                book.period_paid_total(auth_id, ts),
             ),
             pool="admission",
         )
@@ -2085,14 +2093,25 @@ def validate_execute_standing_payment_payload(
             return format_error(
                 f"execute_standing_payment rejected: the authorization's "
                 f"clause did not produce legs ({detail})")
-        clause_legs, why = decode_standing_clause_legs(entry, outputs)
-        if clause_legs is None:
-            return format_error(f"execute_standing_payment rejected: {why}")
+        if entry.form == STANDING_FORM_TAU_DECIDING_RULE:
+            clause_verdict, clause_periods, clause_legs, why = (
+                decode_standing_rule_outputs(entry, outputs)
+            )
+            if clause_legs is None and clause_verdict is None:
+                return format_error(
+                    f"execute_standing_payment rejected: {why}")
+        else:
+            clause_legs, why = decode_standing_clause_legs(entry, outputs)
+            if clause_legs is None:
+                return format_error(
+                    f"execute_standing_payment rejected: {why}")
     try:
         decision = book.execution_due(
             auth_id, ts, balance,
             executor_pubkey=sender if isinstance(sender, str) else None,
             clause_legs=clause_legs,
+            clause_verdict=clause_verdict,
+            clause_periods=clause_periods,
         )
     except StandingPaymentShapeError as exc:
         return format_error(f"Malformed execute_standing_payment: {exc}.")
@@ -2304,18 +2323,21 @@ def validate_execute_payout_rule_payload(
     ts = tip_view.next_block_timestamp
     balance = tip_view.get_balance(row["owner_pubkey"])
     clause_legs = None
+    clause_verdict = None
     entry = book.get_by_id(rule_id)
-    if entry is not None and entry.form == FORM_TAU_RULE:
+    if entry is not None and entry.form in (
+        FORM_TAU_RULE,
+        PAYOUT_FORM_TAU_DECIDING_RULE,
+    ):
         from consensus import sender_policy
 
         sender = tx.get("sender_pubkey")
         outputs, detail = sender_policy.clause_outputs(
             entry.clause_text,
-            payout_clause_inputs(
+            book.clause_inputs_for(
                 entry,
                 sender if isinstance(sender, str) else "",
                 base_amount, ts, balance,
-                book.period_paid_total(entry, ts),
             ),
             pool="admission",
         )
@@ -2323,12 +2345,21 @@ def validate_execute_payout_rule_payload(
             return format_error(
                 f"execute_payout_rule rejected: the payout rule's clause "
                 f"did not produce legs ({detail})")
-        clause_legs, why = decode_clause_legs(entry, outputs)
-        if clause_legs is None:
-            return format_error(f"execute_payout_rule rejected: {why}")
+        if entry.form == PAYOUT_FORM_TAU_DECIDING_RULE:
+            clause_verdict, clause_legs, why = decode_payout_rule_outputs(
+                entry, outputs
+            )
+            if clause_legs is None and clause_verdict is None:
+                return format_error(
+                    f"execute_payout_rule rejected: {why}")
+        else:
+            clause_legs, why = decode_clause_legs(entry, outputs)
+            if clause_legs is None:
+                return format_error(f"execute_payout_rule rejected: {why}")
     decision = book.evaluate_execution(
         rule_id, settlement_id, base_amount, ts, balance,
         clause_legs=clause_legs,
+        clause_verdict=clause_verdict,
     )
     if not decision.executed:
         return format_error(
