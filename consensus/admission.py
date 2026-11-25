@@ -1307,9 +1307,11 @@ def _recipient_policy_inactive_refusal(
         return None
     return format_error(
         "Recipient-side policy is not active on this chain. This rule reads "
-        "i17/i16 (the recipient hold/context streams), so it could only run "
-        "as an inbound recipient rule; the feature activates by governance "
-        "patch (recipient_policy_active), which reserves i17 and i16.",
+        "i17/i16 (the recipient hold/context streams) or i28/i29/i32 (the "
+        "recipient condition-fact streams), so it could only run as an "
+        "inbound recipient rule; the feature activates by governance "
+        "patch (recipient_policy_active), which reserves i17, i16, i28, "
+        "i29 and i32.",
         code="RECIPIENT_POLICY_INACTIVE",
     )
 
@@ -1665,12 +1667,23 @@ def validate_retractable_transfer_payload(
                 code="DEADLINE_AFTER_RELEASE",
             )
 
+    from consensus import sender_policy
+
     return success({
         "retractable_id": retractable_id.hex(),
         "amount": park.amount,
         "recipient_pubkey": park.recipient_pubkey,
         "release_kind": park.kind,
         "release_at": park.release_at,
+        # The park's condition terms as the recipient gate will judge
+        # them (Bounty 03 parts 3-4): stream index -> fed value, every
+        # fact stream present, 0 for a term the park does not carry.
+        # Malformed terms already refused above, inside
+        # parse_retractable_transfer.
+        "condition_facts": {
+            str(idx): value
+            for idx, value in sender_policy.condition_facts(park.terms).items()
+        },
     })
 
 

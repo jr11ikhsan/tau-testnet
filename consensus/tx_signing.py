@@ -121,6 +121,14 @@ def signing_message_bytes(payload: Dict[str, Any]) -> bytes:
         signing_dict["amount"] = payload.get("amount")
         signing_dict["release_at_height"] = payload.get("release_at_height")
         signing_dict["release_at_time"] = payload.get("release_at_time")
+        # The condition terms (Bounty 03 parts 3-4) are signed on the same
+        # principle: the recipient gate judges the payment by them, so a
+        # proposer must not be able to strip or rewrite them in transit.
+        signing_dict["allowance_amount"] = payload.get("allowance_amount")
+        signing_dict["allowance_period_seconds"] = payload.get(
+            "allowance_period_seconds")
+        signing_dict["refund_delay"] = payload.get("refund_delay")
+        signing_dict["expiry_seconds"] = payload.get("expiry_seconds")
     elif tx_type == TX_TYPE_RETRACT_TRANSFER:
         signing_dict["retractable_id"] = payload.get("retractable_id")
 

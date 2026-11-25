@@ -678,12 +678,22 @@ def build_retractable_transfer_tx(
     release_at_height: int | None = None,
     release_at_time: int | None = None,
     fee_limit: str | int = "0",
+    allowance_amount: int | None = None,
+    allowance_period_seconds: int | None = None,
+    refund_delay: int | None = None,
+    expiry_seconds: int | None = None,
 ) -> dict:
     """Construct a ``tx_type='retractable_transfer'`` payload (without signature).
 
     Exactly one release point. Admission refuses a park that could be mined at or
     after its own release, so the deadline is clamped to it: ``expire_at_height``
     to ``release_at_height``, or ``expiration_time`` below ``release_at_time``.
+
+    The optional condition terms (Bounty 03 parts 3-4) ride as signed root
+    fields the recipient gate judges at park creation: an allowance
+    (``allowance_amount`` per ``allowance_period_seconds`` — the pair, or
+    neither), an encoded ``refund_delay`` (0 = never, 1 = at once,
+    1 + N = after N seconds) and ``expiry_seconds`` (0 = never).
     """
     if not isinstance(recipient_pubkey, str) or len(recipient_pubkey) != 96:
         raise ValueError("recipient_pubkey must be a 96-character hex public key")
@@ -715,6 +725,16 @@ def build_retractable_transfer_tx(
         expiration_time = min(expiration_time, release_at_time - 1)
     tx["expiration_time"] = expiration_time
     tx["expire_at_height"] = expire_at_height
+    for name, value in (
+        ("allowance_amount", allowance_amount),
+        ("allowance_period_seconds", allowance_period_seconds),
+        ("refund_delay", refund_delay),
+        ("expiry_seconds", expiry_seconds),
+    ):
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+            tx[name] = value
     return tx
 
 

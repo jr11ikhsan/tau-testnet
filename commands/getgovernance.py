@@ -203,6 +203,23 @@ def execute(raw_command: str, container):
                     "context_stream": tau_defs.CONTEXT_STREAM_INDEX,
                     "hold_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
                     "context_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    # Condition facts (parts 3-4), same width, fed only
+                    # while active. The stream allocation is PROVISIONAL
+                    # (see tau_defs): it follows the canonical layout
+                    # proposed on issue #47 and moves if Bounty 01's
+                    # allocation decision lands differently.
+                    "allowance_stream": tau_defs.ALLOWANCE_STREAM_INDEX,
+                    "allowance_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "allowance_normalisation_seconds": tau_defs.SECONDS_PER_30_DAYS,
+                    "refund_delay_stream": tau_defs.REFUND_DELAY_STREAM_INDEX,
+                    "refund_delay_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "refund_delay_encoding": (
+                        "0 = never refundable, 1 = refundable at once, "
+                        "1 + N = refundable after N seconds"
+                    ),
+                    "expiry_stream": tau_defs.EXPIRY_STREAM_INDEX,
+                    "expiry_stream_width": tau_defs.RECIPIENT_STREAM_BV_WIDTH,
+                    "expiry_encoding": "seconds until the payment expires; 0 = never",
                     "contexts": {
                         "outgoing": tau_defs.CONTEXT_OUTGOING,
                         "incoming_final": tau_defs.CONTEXT_INCOMING_FINAL,

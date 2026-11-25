@@ -140,18 +140,46 @@ def _streams_read(body) -> set:
 
 
 def clause_is_inbound_capable(body) -> bool:
-    """True when a clause opts into inbound judging by reading i17 or i16.
+    """True when a clause opts into inbound judging by reading i17 or i16,
+    or any of the condition-fact streams (i28/i29/i32, parts 3-4).
 
     The opt-in is what makes the set of inbound-capable clauses statically
-    decidable at deploy: a clause reading neither stream is never invoked
-    inbound (the neutral default), and a clause reading only i3 keeps exactly
-    its outbound meaning.
+    decidable at deploy: a clause reading none of those streams is never
+    invoked inbound (the neutral default), and a clause reading only i3
+    keeps exactly its outbound meaning.
     """
     read = _streams_read(body)
     return (
         tau_defs.HOLD_STREAM_INDEX in read
         or tau_defs.CONTEXT_STREAM_INDEX in read
+        or any(idx in read for idx in tau_defs.recipient_fact_indices())
     )
+
+
+def condition_facts(terms) -> dict:
+    """Stream index -> fed value for a payment's condition terms
+    (`consensus.retractable.ConditionTerms`, or None for a payment that
+    carries none — a plain transfer, or a park without terms).
+
+    Every fact stream is present in the result: an absent term feeds 0,
+    which is each stream's "no condition" value (no allowance cap, never
+    refundable / no refund term, never expires). The allowance is fed
+    normalised to a 30-day rate — the exact integer normalisation in
+    `consensus.retractable.normalize_allowance_30d`.
+    """
+    facts = {idx: 0 for idx in tau_defs.recipient_fact_indices()}
+    if terms is None:
+        return facts
+    if terms.allowance_amount is not None:
+        from consensus.retractable import normalize_allowance_30d
+
+        facts[tau_defs.ALLOWANCE_STREAM_INDEX] = normalize_allowance_30d(
+            terms.allowance_amount, terms.allowance_period_seconds)
+    if terms.refund_delay is not None:
+        facts[tau_defs.REFUND_DELAY_STREAM_INDEX] = int(terms.refund_delay)
+    if terms.expiry_seconds is not None:
+        facts[tau_defs.EXPIRY_STREAM_INDEX] = int(terms.expiry_seconds)
+    return facts
 
 
 def clause_reads_hold_without_context(body) -> bool:
@@ -170,13 +198,21 @@ def clause_reads_hold_without_context(body) -> bool:
     )
 
 
-def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
+def recipient_hold_inputs(values: dict, *, hold: int, context: int,
+                          facts: dict = None) -> dict:
     """A copy of a transfer input map with the gate's overlay forced in.
 
     i17 = the hold in its native unit, i16 = the judgment context. Forced —
     never merged — so a sender-supplied value on either stream (possible in
     a parked request's custom inputs before activation) never reaches the
     recipient's clause.
+
+    When `facts` is given (the recipient pass always gives it), the
+    condition-fact streams i28/i29/i32 are forced the same way from it —
+    a stream missing from `facts` feeds 0, its "no condition" value — so
+    a sender-supplied custom input on a fact stream never reaches the
+    recipient's clause either. Callers that judge the SENDER's own clause
+    (the sender pass) pass no facts and leave those streams alone.
 
     Forced under EVERY key shape: the same stream can be spelled `17`,
     `"17"` or `"i17"` in a hand-built map, and the clause path collapses
@@ -192,6 +228,11 @@ def recipient_hold_inputs(values: dict, *, hold: int, context: int) -> dict:
         out.pop(f"i{idx}", None)
     out[tau_defs.HOLD_STREAM_INDEX] = str(int(hold))
     out[tau_defs.CONTEXT_STREAM_INDEX] = str(int(context))
+    if facts is not None:
+        for idx in tau_defs.recipient_fact_indices():
+            out.pop(str(idx), None)
+            out.pop(f"i{idx}", None)
+            out[idx] = str(int(facts.get(idx, 0)))
     return out
 
 
@@ -223,29 +264,51 @@ def park_hold(kind: int, release_at: int, block_height: int,
         tau_defs.CONTEXT_INCOMING_TIME_PARK
 
 
-_HOLD_CMP_RE = re.compile(
-    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
-    r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
-)
-_HOLD_CMP_FLIPPED_RE = re.compile(
-    r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
-    r"\s*(<=|>=|<|>)\s*\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
-)
+def _stream_patterns(idx: int):
+    """The comparison/mention patterns for one gated stream, compiled once:
+    (literal cmp, flipped literal cmp, stream cmp, flipped stream cmp,
+    mention). The cap machinery below is written against these, so the
+    hold stream (i17) and the allowance stream (i28) share one
+    implementation — a cap is extracted and verified by exactly the same
+    rules whichever gated stream a clause caps."""
+    cached = _STREAM_PATTERNS.get(idx)
+    if cached is not None:
+        return cached
+    s = str(idx)
+    patterns = (
+        re.compile(
+            r"\bi" + s + r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+            r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
+        ),
+        re.compile(
+            r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
+            r"\s*(<=|>=|<|>)\s*\bi" + s + r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+        ),
+        re.compile(
+            r"\bi" + s + r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+            r"i(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+        ),
+        re.compile(
+            r"\bi(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
+            r"i" + s + r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+        ),
+        re.compile(
+            r"\bi" + s + r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
+        ),
+    )
+    _STREAM_PATTERNS[idx] = patterns
+    return patterns
+
+
+_STREAM_PATTERNS: dict = {}
+
+_HOLD_CMP_RE, _HOLD_CMP_FLIPPED_RE, _HOLD_STREAM_CMP_RE, \
+    _HOLD_STREAM_CMP_FLIPPED_RE, _HOLD_MENTION_RE = _stream_patterns(
+        tau_defs.HOLD_STREAM_INDEX)
 _CONTEXT_GUARD_RE = re.compile(
     r"\bi" + str(tau_defs.CONTEXT_STREAM_INDEX) +
     r"\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*=\s*"
     r"\{\s*(?:#x([0-9a-fA-F]+)|#b([01]+)|(\d+))\s*\}\s*:\s*bv\s*\[\s*64\s*\]"
-)
-_HOLD_STREAM_CMP_RE = re.compile(
-    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
-    r"i(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
-)
-_HOLD_STREAM_CMP_FLIPPED_RE = re.compile(
-    r"\bi(\d+)\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]\s*(<=|>=|<|>)\s*"
-    r"i17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
-)
-_HOLD_MENTION_RE = re.compile(
-    r"\bi17\s*\[\s*t\s*\]\s*:\s*bv\s*\[\s*64\s*\]"
 )
 
 # Past this many change points in one branch the cap is reported without a
@@ -264,19 +327,20 @@ def _literal_value(match, base: int) -> int:
     return int(dec_part)
 
 
-def _branch_change_points(body, context: int, fed: dict = None):
-    """The hold values at which the verdict for `context` can change, or
-    None when this branch's cap cannot be named soundly.
+def _branch_change_points(body, context: int, fed: dict = None,
+                          stream: int = tau_defs.HOLD_STREAM_INDEX):
+    """The values of `stream` at which the verdict for `context` can
+    change, or None when this branch's cap cannot be named soundly.
 
     A cap is named ONLY from change points this payment fixes:
 
-    - every i17 mention attributed to this branch must be a DIRECT
-      comparison — against a bv[64] literal, or against another bv[64]
-      stream whose value this payment fixes (resolved from `fed`, the
-      input map the clause is judged with). A mention doing anything
-      else (arithmetic, a comparison with i16/i17 itself, a stream this
-      payment does not fix) means the branch's threshold is not a fixed
-      set of points, and no cap is named;
+    - every mention of `stream` attributed to this branch must be a
+      DIRECT comparison — against a bv[64] literal, or against another
+      bv[64] stream whose value this payment fixes (resolved from `fed`,
+      the input map the clause is judged with). A mention doing anything
+      else (arithmetic, a comparison with i16 or the stream itself, a
+      stream this payment does not fix) means the branch's threshold is
+      not a fixed set of points, and no cap is named;
     - comparisons in other branches are that branch's business: they are
       attributed by the same positional i16-guard rule the extractor has
       always used and checked when that branch's cap is named.
@@ -284,11 +348,15 @@ def _branch_change_points(body, context: int, fed: dict = None):
     Returns the sorted, de-duplicated polarity-adjusted bounds (the same
     operator-to-cap mapping the literal extractor has always used); the
     caller verifies them against actual evaluation before printing.
+    Written for the hold stream (i17) originally; the allowance stream
+    (i28) runs through the identical rules.
     """
     if not body:
         return None
     from consensus.rule_offers import strip_clause_comments
 
+    cmp_re, cmp_flipped_re, stream_cmp_re, stream_cmp_flipped_re, \
+        mention_re = _stream_patterns(stream)
     scrubbed = strip_clause_comments(body)
     guards = [
         (m.start(), _literal_value(m, 1)) for m in _CONTEXT_GUARD_RE.finditer(scrubbed)
@@ -307,7 +375,7 @@ def _branch_change_points(body, context: int, fed: dict = None):
         return not guards or branch_of(pos) == context
 
     mentions = [
-        m.start() for m in _HOLD_MENTION_RE.finditer(scrubbed)
+        m.start() for m in mention_re.finditer(scrubbed)
         if in_branch(m.start())
     ]
     if not mentions:
@@ -323,27 +391,27 @@ def _branch_change_points(body, context: int, fed: dict = None):
         points.append(bound - 1 if op in adjust else bound)
         covered.append((match.start(), match.end()))
 
-    for m in _HOLD_CMP_RE.finditer(scrubbed):
+    for m in cmp_re.finditer(scrubbed):
         note_literal(m, _literal_value(m, 2), m.group(1), flipped=False)
-    for m in _HOLD_CMP_FLIPPED_RE.finditer(scrubbed):
+    for m in cmp_flipped_re.finditer(scrubbed):
         note_literal(m, _literal_value(m, 1), m.group(4), flipped=True)
 
-    for match in _HOLD_STREAM_CMP_RE.finditer(scrubbed):
+    for match in stream_cmp_re.finditer(scrubbed):
         if not in_branch(match.start()):
             continue
         op, idx = match.group(1), int(match.group(2))
-        if idx in (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX):
+        if idx in (stream, tau_defs.CONTEXT_STREAM_INDEX):
             return None
         raw = (fed or {}).get(f"i{idx}")
         if raw is None or not re.fullmatch(r"\d+", str(raw).strip()):
             return None
         points.append(int(raw) - 1 if op in ("<", ">=") else int(raw))
         covered.append((match.start(), match.end()))
-    for match in _HOLD_STREAM_CMP_FLIPPED_RE.finditer(scrubbed):
+    for match in stream_cmp_flipped_re.finditer(scrubbed):
         if not in_branch(match.start()):
             continue
         idx, op = int(match.group(1)), match.group(2)
-        if idx in (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX):
+        if idx in (stream, tau_defs.CONTEXT_STREAM_INDEX):
             return None
         raw = (fed or {}).get(f"i{idx}")
         if raw is None or not re.fullmatch(r"\d+", str(raw).strip()):
@@ -360,14 +428,19 @@ def _branch_change_points(body, context: int, fed: dict = None):
     return points
 
 
-def _fed_values(values: dict, context: int) -> dict:
+def _fed_values(values: dict, context: int, facts: dict = None) -> dict:
     """The bare input map the recipient's clause is judged with for this
-    payment (gate overlay forced, hold irrelevant to every other stream)."""
-    return clause_inputs(recipient_hold_inputs(values, hold=0, context=context))
+    payment (gate overlay forced, hold irrelevant to every other stream;
+    the condition facts ride along when given)."""
+    return clause_inputs(recipient_hold_inputs(
+        values, hold=0, context=context, facts=facts))
 
 
-def extract_candidate_cap(body, context: int, values: dict = None):
-    """A candidate hold cap for `context`, from the branch's change points.
+def extract_candidate_cap(body, context: int, values: dict = None,
+                          stream: int = tau_defs.HOLD_STREAM_INDEX,
+                          facts: dict = None):
+    """A candidate cap for `context` on `stream`, from the branch's
+    change points.
 
     A HINT, never a verdict: the caller verifies the candidate against the
     clause's actual evaluation before printing it (see
@@ -380,23 +453,37 @@ def extract_candidate_cap(body, context: int, values: dict = None):
     `values` (this payment's input map) fixes that stream's value; with
     `values=None` such a clause names no cap here.
     """
-    fed = _fed_values(values, context) if values is not None else None
-    points = _branch_change_points(body, context, fed)
+    fed = _fed_values(values, context, facts) if values is not None else None
+    points = _branch_change_points(body, context, fed, stream=stream)
     if not points:
         return None
     return min(points)
 
 
+def _threshold_verified(judge, *, cap: int, points, unit_max: int) -> bool:
+    """True when `judge(value) -> blocked` is a single threshold at `cap`
+    across the whole change-point set: admitted exactly at values <= cap.
+    Evaluates 0, the unit maximum, and every change point and its
+    successor — a holed rule (admits 0..101 and 5000..6000, refuses
+    between) fails at the hole's edge and is honestly reported without a
+    number, as is any rule whose verdict moves anywhere the points did
+    not predict."""
+    probes = {0, unit_max}
+    for point in points:
+        probes.add(min(point, unit_max))
+        probes.add(min(point + 1, unit_max))
+    for value in sorted(probes):
+        if judge(value) == (value <= cap):
+            return False
+    return True
+
+
 def _cap_verified(body, values: dict, *, cap: int, context: int,
-                  points, pool: str, timeout) -> bool:
-    """True when the clause's verdict for THIS counterparty (the actual
-    sender, amount and context in `values`) is a single threshold at
-    `cap` across the branch's whole change-point set: admitted exactly
-    at holds <= cap. Evaluates hold 0, the unit maximum, and every
-    change point and its successor — a holed rule (admits 0..101 and
-    5000..6000, refuses between) fails at the hole's edge and is
-    honestly reported without a number, as is any rule whose verdict
-    moves anywhere the points did not predict."""
+                  points, pool: str, timeout, facts: dict = None) -> bool:
+    """`_threshold_verified` for the hold stream: the clause's verdict for
+    THIS counterparty (the actual sender, amount, context and condition
+    facts in `values`/`facts`) is a single threshold at `cap`, admitted
+    exactly at holds <= cap."""
     from consensus.retractable import (
         MAX_RELEASE_WINDOW_BLOCKS,
         MAX_RELEASE_WINDOW_SECONDS,
@@ -405,27 +492,93 @@ def _cap_verified(body, values: dict, *, cap: int, context: int,
     unit_max = MAX_RELEASE_WINDOW_SECONDS \
         if context == tau_defs.CONTEXT_INCOMING_TIME_PARK \
         else MAX_RELEASE_WINDOW_BLOCKS
-    probes = {0, unit_max}
-    for point in points:
-        probes.add(min(point, unit_max))
-        probes.add(min(point + 1, unit_max))
-    for hold in sorted(probes):
+
+    def judge(hold):
         blocked, _ = clause_blocks(
-            body, recipient_hold_inputs(values, hold=hold, context=context),
+            body, recipient_hold_inputs(
+                values, hold=hold, context=context, facts=facts),
             pool=pool, timeout=timeout,
         )
-        if blocked == (hold <= cap):
-            return False
-    return True
+        return blocked
+
+    return _threshold_verified(
+        judge, cap=cap, points=points, unit_max=unit_max)
+
+
+def _fact_refusal(body, values: dict, *, idx: int, fact_values: dict,
+                  hold: int, context: int, pool: str, timeout) -> dict:
+    """The receipt fields for a refusal attributed to ONE condition fact.
+
+    The measured fact is node-computed, so it is always reported. A cap
+    number is printed only for the allowance, and only when verified
+    against this payer's actual evaluation by the same change-point
+    machinery as the hold cap; refund and expiry refusals carry
+    `cap_kind` "rule" and no cap number — the gate does not print a
+    threshold it has not verified.
+    """
+    measured = fact_values[idx]
+    if idx == tau_defs.ALLOWANCE_STREAM_INDEX:
+        info = {
+            "reason": "recipient_allowance_limit",
+            "code": "RECIPIENT_ALLOWANCE_LIMIT",
+            "allowance_30d": measured,
+        }
+        points = _branch_change_points(
+            body, context, _fed_values(values, context, fact_values),
+            stream=idx)
+        candidate = min(points) if points else None
+
+        def judge(value):
+            trial = dict(fact_values)
+            trial[idx] = value
+            blocked, _ = clause_blocks(
+                body, recipient_hold_inputs(
+                    values, hold=hold, context=context, facts=trial),
+                pool=pool, timeout=timeout,
+            )
+            return blocked
+
+        if candidate is not None and _threshold_verified(
+            judge, cap=candidate, points=points, unit_max=(1 << 64) - 1,
+        ):
+            info["cap_kind"] = "threshold"
+            info["max_allowance_30d"] = candidate
+        else:
+            info["cap_kind"] = "rule"
+        return info
+    if idx == tau_defs.REFUND_DELAY_STREAM_INDEX:
+        if measured == 0:
+            timing, seconds = "never", None
+        elif measured == 1:
+            timing, seconds = "at_once", 0
+        else:
+            timing, seconds = "after_delay", measured - 1
+        return {
+            "reason": "recipient_refund_delay",
+            "code": "RECIPIENT_REFUND_DELAY",
+            "refund_delay": measured,
+            "refund_timing": timing,
+            "refund_delay_seconds": seconds,
+            "cap_kind": "rule",
+        }
+    return {
+        "reason": "recipient_expiry",
+        "code": "RECIPIENT_EXPIRY",
+        "expiry_seconds": measured,
+        "cap_kind": "rule",
+    }
 
 
 def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
                             hold: int, context: int, pool: str,
-                            timeout=_SESSION_DEFAULT):
+                            timeout=_SESSION_DEFAULT,
+                            facts: dict = None):
     """(blocked, info) for the recipient's clause on one inbound transfer.
 
     `values` is the transfer input map BEFORE the gate overlay; the overlay
-    is forced in here. `info` is None when the recipient has no
+    is forced in here. `facts` is the payment's condition-fact map
+    (`condition_facts`); omitted means the payment carries no terms, so
+    every fact stream feeds 0. `info` is None when the recipient has no
     inbound-capable clause (the neutral default — nothing was evaluated).
     On a block, `info` carries the receipt fields:
 
@@ -435,13 +588,35 @@ def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
     - for a hold refusal: the measured `hold` and its `unit`, plus the cap
       ONLY when verified against this payer's actual evaluation
       (`cap_kind` "threshold" with `max_hold_seconds`/`max_hold_blocks`),
-      else `cap_kind` "rule" and no number.
+      else `cap_kind` "rule" and no number;
+    - when the block is caused by a condition fact (some value of that
+      fact alone admits the payment, everything else unchanged):
+      "recipient_allowance_limit", "recipient_refund_delay" or
+      "recipient_expiry" — with the measured fact, and for the allowance
+      a verified cap under the same rules as the hold — else, when the
+      facts only explain the block together, "recipient_condition_block"
+      with every measured fact.
     """
     body = clause_for(recipient, tau_defs.USER_POLICY_STREAM_INDEX)
     if not body or not clause_is_inbound_capable(body):
         return False, None
 
-    judged = recipient_hold_inputs(values, hold=hold, context=context)
+    fact_values = {idx: 0 for idx in tau_defs.recipient_fact_indices()}
+    for idx, value in (facts or {}).items():
+        if idx in fact_values:
+            fact_values[idx] = int(value)
+    zero_facts = {idx: 0 for idx in fact_values}
+
+    def judge(h, fv):
+        blocked, _ = clause_blocks(
+            body, recipient_hold_inputs(
+                values, hold=h, context=context, facts=fv),
+            pool=pool, timeout=timeout,
+        )
+        return blocked
+
+    judged = recipient_hold_inputs(
+        values, hold=hold, context=context, facts=fact_values)
     blocked, o5 = clause_blocks(body, judged, pool=pool, timeout=timeout)
     if not blocked:
         return False, {"o5": o5}
@@ -451,41 +626,82 @@ def recipient_clause_blocks(clause_for, recipient: str, values: dict, *,
         "recipient": recipient,
         "reason": "recipient_policy_block",
     }
-    if context == tau_defs.CONTEXT_OUTGOING or int(hold) <= 0:
+    if context == tau_defs.CONTEXT_OUTGOING:
         return True, info
 
     # Was it the hold that refused, or the allow-list? Re-judge at hold 0 in
-    # the same context: an allow-list block refuses at every hold.
-    at_zero, _ = clause_blocks(
-        body, recipient_hold_inputs(values, hold=0, context=context),
-        pool=pool, timeout=timeout,
-    )
-    if at_zero:
+    # the same context, facts unchanged: an allow-list block refuses at
+    # every hold.
+    if int(hold) > 0 and not judge(0, fact_values):
+        unit = "seconds" if context == tau_defs.CONTEXT_INCOMING_TIME_PARK \
+            else "blocks"
+        info.update({
+            "reason": "recipient_max_hold",
+            # The code the issues name for this refusal, carried alongside
+            # the measured hold and its unit so a wallet can always print
+            # the sentence ("accepts payments held for up to ...") — with
+            # the cap itself present only when verified below.
+            "code": "RECIPIENT_MAX_HOLD",
+            "hold": int(hold),
+            "unit": unit,
+        })
+        points = _branch_change_points(
+            body, context, _fed_values(values, context, fact_values))
+        candidate = min(points) if points else None
+        if candidate is not None and _cap_verified(
+            body, values, cap=candidate, context=context, points=points,
+            pool=pool, timeout=timeout, facts=fact_values,
+        ):
+            info["cap_kind"] = "threshold"
+            info["max_hold_seconds" if unit == "seconds"
+                 else "max_hold_blocks"] = candidate
+        else:
+            info["cap_kind"] = "rule"
         return True, info
 
-    unit = "seconds" if context == tau_defs.CONTEXT_INCOMING_TIME_PARK \
-        else "blocks"
-    info.update({
-        "reason": "recipient_max_hold",
-        # The code the issues name for this refusal, carried alongside the
-        # measured hold and its unit so a wallet can always print the
-        # sentence ("accepts payments held for up to ...") — with the cap
-        # itself present only when verified below.
-        "code": "RECIPIENT_MAX_HOLD",
-        "hold": int(hold),
-        "unit": unit,
-    })
-    points = _branch_change_points(body, context, _fed_values(values, context))
-    candidate = min(points) if points else None
-    if candidate is not None and _cap_verified(
-        body, values, cap=candidate, context=context, points=points,
-        pool=pool, timeout=timeout,
-    ):
-        info["cap_kind"] = "threshold"
-        info["max_hold_seconds" if unit == "seconds"
-             else "max_hold_blocks"] = candidate
-    else:
-        info["cap_kind"] = "rule"
+    # Was it a condition fact? A fact caused the block when SOME value of
+    # that fact alone admits the payment with everything else unchanged.
+    # The probes are 0, 1, the unit maximum, and the branch's change
+    # points for that stream and their successors. Zero is probed but
+    # not privileged: a clause may refuse a fact's zero value (a
+    # recipient who requires refundability refuses "never"), so
+    # attribution is the existence of an admitting value, never the
+    # assumption that zeroing must admit.
+    for idx in tau_defs.recipient_fact_indices():
+        points = _branch_change_points(
+            body, context, _fed_values(values, context, fact_values),
+            stream=idx) or []
+        unit_max = (1 << 64) - 1
+        probes = {0, 1, unit_max}
+        for point in points:
+            probes.add(min(point, unit_max))
+            probes.add(min(point + 1, unit_max))
+        for probe in sorted(probes):
+            if probe == fact_values[idx]:
+                continue
+            trial = dict(fact_values)
+            trial[idx] = probe
+            if not judge(int(hold), trial):
+                info.update(_fact_refusal(
+                    body, values, idx=idx, fact_values=fact_values,
+                    hold=int(hold), context=context, pool=pool,
+                    timeout=timeout,
+                ))
+                return True, info
+
+    # No single fact explains it: the facts together may (zeroing every
+    # fact admits, zeroing any one does not).
+    if any(fact_values.values()) and not judge(int(hold), zero_facts):
+        info.update({
+            "reason": "recipient_condition_block",
+            "code": "RECIPIENT_CONDITION_BLOCK",
+            "allowance_30d": fact_values[tau_defs.ALLOWANCE_STREAM_INDEX],
+            "refund_delay": fact_values[tau_defs.REFUND_DELAY_STREAM_INDEX],
+            "expiry_seconds": fact_values[tau_defs.EXPIRY_STREAM_INDEX],
+            "cap_kind": "rule",
+        })
+        return True, info
+
     return True, info
 
 
@@ -540,11 +756,12 @@ def spec_mentions_account(spec_text, pubkey: str) -> bool:
 
 
 def guarded_pass_inputs(values: dict, recipient: str, *, hold: int,
-                        context: int) -> dict:
+                        context: int, facts: dict = None) -> dict:
     """Input map for the guarded-mode recipient pass: the transfer map with
     i12 set to the RECIPIENT (the 'acting-as / policy owner' reading), plus
     the gate overlay. i3 stays the sender — the counterparty the recipient's
     guard matches on."""
-    out = recipient_hold_inputs(values, hold=hold, context=context)
+    out = recipient_hold_inputs(values, hold=hold, context=context,
+                                facts=facts)
     out[12] = "{ #x" + str(recipient) + " }:bv[384]"
     return out

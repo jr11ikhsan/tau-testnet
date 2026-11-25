@@ -62,6 +62,23 @@ class RetractableShapeError(ValueError):
 
 
 @dataclass(frozen=True)
+class ConditionTerms:
+    """The conditions a park's sender attaches to the payment (Bounty 03
+    parts 3-4): an optional spending allowance (amount per period), an
+    optional encoded refund delay, an optional expiry. Every field None
+    means the payment carries no such term.
+
+    Judged exactly once, by the recipient gate, when the park is created;
+    a release or retract is never re-judged, so the terms are not part of
+    the entry's id, the book's root, or its persisted rows.
+    """
+    allowance_amount: Optional[int] = None
+    allowance_period_seconds: Optional[int] = None
+    refund_delay: Optional[int] = None
+    expiry_seconds: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class RetractableEntry:
     sender_pubkey: str
     recipient_pubkey: str
@@ -69,6 +86,7 @@ class RetractableEntry:
     sequence_number: int
     kind: int
     release_at: int
+    terms: Optional[ConditionTerms] = None
 
     @property
     def retractable_id(self) -> bytes:
@@ -109,6 +127,56 @@ def _u64_field(tx: Dict[str, Any], name: str) -> int:
     return value
 
 
+def normalize_allowance_30d(amount: int, period_seconds: int) -> int:
+    """An allowance of `amount` per `period_seconds`, normalised to a
+    30-day rate by exact integer arithmetic:
+    floor(amount * 2_592_000 / period_seconds) — the normalisation the
+    canonical layout documents (a weekly 500 becomes 2_142 per 30 days).
+    The floor is part of the definition: an allowance below one unit per
+    30 days normalises to 0."""
+    return (int(amount) * 2_592_000) // int(period_seconds)
+
+
+def _optional_u64_field(tx: Dict[str, Any], name: str) -> Optional[int]:
+    if tx.get(name) is None:
+        return None
+    return _u64_field(tx, name)
+
+
+def parse_condition_terms(tx: Dict[str, Any]) -> ConditionTerms:
+    """The condition terms a park transaction carries, from ROOT fields
+    only (the same signed surface as the release point — the fields are
+    in the retractable signing dict, consensus/tx_signing.py).
+
+    Malformed terms are a shape error, so admission and apply refuse the
+    park identically (fail-closed): a term that is not an unsigned
+    64-bit integer, exactly one half of the allowance pair, a zero
+    allowance period, or an allowance whose 30-day normalisation does
+    not fit the bv[64] fact stream it will be fed on.
+    """
+    amount = _optional_u64_field(tx, "allowance_amount")
+    period = _optional_u64_field(tx, "allowance_period_seconds")
+    if (amount is None) != (period is None):
+        raise RetractableShapeError(
+            "allowance_amount and allowance_period_seconds must be given together"
+        )
+    if period is not None:
+        if period == 0:
+            raise RetractableShapeError(
+                "allowance_period_seconds must be at least 1"
+            )
+        if normalize_allowance_30d(amount, period) > _U64_MAX:
+            raise RetractableShapeError(
+                "allowance normalises past the bv[64] fact stream"
+            )
+    return ConditionTerms(
+        allowance_amount=amount,
+        allowance_period_seconds=period,
+        refund_delay=_optional_u64_field(tx, "refund_delay"),
+        expiry_seconds=_optional_u64_field(tx, "expiry_seconds"),
+    )
+
+
 def parse_retractable_transfer(tx: Dict[str, Any]) -> RetractableEntry:
     """Read a park from ROOT fields only; a nested `payload` is unsigned data."""
     if not isinstance(tx, dict):
@@ -128,7 +196,9 @@ def parse_retractable_transfer(tx: Dict[str, Any]) -> RetractableEntry:
         kind, release_at = KIND_HEIGHT, _u64_field(tx, "release_at_height")
     else:
         kind, release_at = KIND_TIME, _u64_field(tx, "release_at_time")
-    return RetractableEntry(sender, recipient, amount, sequence, kind, release_at)
+    terms = parse_condition_terms(tx)
+    return RetractableEntry(
+        sender, recipient, amount, sequence, kind, release_at, terms)
 
 
 def parse_retract_transfer(tx: Dict[str, Any]) -> RetractRequest:

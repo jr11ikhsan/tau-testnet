@@ -178,20 +178,23 @@ def screen_slot_widths(body: str) -> Optional[str]:
     return None
 
 
-# --- Recipient-control stream width screening (i17, i16) --------------------
+# --- Recipient-control stream width screening (i17, i16, i28, i29, i32) -----
 #
-# Same reject-unless-annotated contract as the approval slots, for the two
-# streams the recipient gate feeds. The gate forces both at bv[64]; one clause
-# typing i17 at another width would pin that width process-wide and make the
-# gate's own feed overflow or fail to build — for everyone, until restart.
+# Same reject-unless-annotated contract as the approval slots, for the
+# streams the recipient gate feeds. The gate forces all of them at bv[64];
+# one clause typing i17 at another width would pin that width process-wide
+# and make the gate's own feed overflow or fail to build — for everyone,
+# until restart.
 
 _RECIPIENT_STREAMS = frozenset({
     tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX,
+    *tau_defs.recipient_fact_indices(),
 })
 
 
 def screen_recipient_stream_widths(body: str) -> Optional[str]:
-    """None when every i17/i16 mention is typed bv[64], else the reason.
+    """None when every recipient-control mention is typed bv[64], else
+    the reason.
 
     Operates on comment-stripped text, like `screen_slot_widths`.
     """
@@ -435,7 +438,8 @@ def audit_recipient_stream_collisions(spec_texts) -> List[str]:
     from consensus.rule_offers import strip_clause_comments
 
     findings: List[str] = []
-    streams = (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX)
+    streams = (tau_defs.HOLD_STREAM_INDEX, tau_defs.CONTEXT_STREAM_INDEX) \
+        + tau_defs.recipient_fact_indices()
 
     for label, text in spec_texts or ():
         if not isinstance(text, str) or not text.strip():

@@ -54,6 +54,45 @@ it would judge seconds and blocks with one number. The same refusal applies
 on a node where the feature is not active yet (`RECIPIENT_POLICY_INACTIVE`),
 so a rule is never silently admitted that will never run.
 
+## Condition facts (parts 3 and 4)
+
+Beside the hold, the gate feeds three facts about the conditions a
+payment carries — the material of parts 3 (spending limits) and 4
+(refund terms) — all `bv[64]`, forced by the node exactly like `i17`:
+
+| Stream | Fact |
+|---|---|
+| `i28` | The payment's allowance normalised to a 30-day rate: `floor(allowance_amount * 2_592_000 / allowance_period_seconds)`. `0` = the payment carries no allowance. |
+| `i29` | The payment's refund delay, encoded: `0` = never refundable, `1` = refundable at once, `1 + N` = refundable after `N` seconds. A payment with no refund term also feeds `0` — "never" and "no term" are the same fact to the recipient, and the encoding does not pretend to separate them. |
+| `i32` | The payment's expiry in seconds. `0` = never expires. |
+
+The terms ride as signed optional fields on the park transaction
+(`allowance_amount` + `allowance_period_seconds`, `refund_delay`,
+`expiry_seconds`); a plain transfer carries none and feeds `0` on all
+three. They are judged once, when the park is created — a release or
+retract is never re-judged — and malformed terms (half an allowance
+pair, a zero period, a normalisation that overflows `bv[64]`) refuse
+the park at parse, identically at admission and at apply. The
+normalisation is exact integer arithmetic, and its floor is part of
+the definition: an allowance below one unit per 30 days normalises
+to `0`. A clause opts into judging the facts by reading any of the
+three streams; a clause reading none of them is unaffected.
+
+The stream allocation is **provisional**: it follows the canonical
+layout proposed on issue #47 (`i28` allowance, `i29` refund delay,
+`i32` expiry, `i27` left to the two-stream block hold). Bounty 01 has
+not frozen the condition-record layout; if the maintainers allocate
+differently, the three indices move and nothing else changes.
+
+A refusal caused by a fact carries its own code —
+`RECIPIENT_ALLOWANCE_LIMIT`, `RECIPIENT_REFUND_DELAY`,
+`RECIPIENT_EXPIRY`, or `RECIPIENT_CONDITION_BLOCK` when the facts only
+explain the refusal together — with the measured fact always, and for
+the allowance the recipient's cap only when verified against this
+payer's own evaluation, under the same change-point rules as the hold
+cap. Refund and expiry refusals carry `cap_kind: "rule"` and no cap
+number: the gate does not print a threshold it has not verified.
+
 ## Activation
 
 `recipient_policy_active` is a one-way governance flag, exactly on the
@@ -61,6 +100,7 @@ so a rule is never silently admitted that will never run.
 only, and `build_mechanism_metadata` emits the key only when on, so the
 legacy consensus meta-hash is pinned while the flag is off. Activation first
 audits the effective spec; if any in-force text already reads `i17`/`i16`
+(or the condition-fact streams `i28`/`i29`/`i32`)
 with a meaning of its own, activation is refused and the flag stays off —
 the chain keeps running. A fresh chain can activate from block 0 with
 `scripts/gen_genesis.py --recipient-policy-active`.
@@ -98,10 +138,13 @@ outputs never reach fee components or any accounting.
 
 ## Pre-flight
 
-`getrecipientpolicy <address> [sender amount hold unit]` is a read-only
+`getrecipientpolicy <address> [sender amount hold unit [allowance_amount
+allowance_period refund_delay expiry_seconds]]` is a read-only
 pre-flight: it reports whether the address has an inbound-capable clause
 and, with the extra arguments, runs the gate once for that payment and
-returns the verified cap when the rule is a threshold rule.
+returns the verified cap when the rule is a threshold rule. The four
+condition-term slots are optional (`-` = the payment carries no such
+term) and the evaluation reports the condition facts it was judged with.
 `getgovernance` reports `recipient_policy_active` and a `capabilities`
 block with the stream numbers and widths, so a wallet can detect the
 feature before asking.

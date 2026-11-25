@@ -367,6 +367,53 @@ CONTEXT_INCOMING_FINAL = 1
 CONTEXT_INCOMING_TIME_PARK = 2
 CONTEXT_INCOMING_HEIGHT_PARK = 3
 
+# --- Recipient condition facts (issues #47 + #76, parts 3 and 4) ------------
+# Three more host-fed streams let the recipient's clause judge a payment by
+# the conditions attached to it — its spending allowance (part 3) and its
+# refund/expiry terms (part 4) — beside the hold on i17:
+#
+#   i28  the payment's allowance normalised to a 30-day rate:
+#        floor(allowance_amount * SECONDS_PER_30_DAYS / allowance_period).
+#        0 = the payment carries no allowance (no cap).
+#   i29  the payment's refund delay, encoded: 0 = never refundable,
+#        1 = refundable at once, 1 + N = refundable after N seconds.
+#        A payment carrying no refund term also feeds 0: "never" and "no
+#        term" are the same fact to the recipient — money that cannot be
+#        pulled back is the most permissive case to accept — and the
+#        encoding cannot (and does not pretend to) separate them.
+#   i32  the payment's expiry in seconds; 0 = never expires (also what a
+#        payment with no expiry term feeds).
+#
+# The terms ride as signed optional fields on the retractable (park)
+# transaction (consensus/retractable.py: parse_condition_terms); a plain
+# transfer carries none and feeds 0 on all three. The facts are judged
+# once, when the park is created — a release or retract is never
+# re-judged — so the terms need no persistence of their own.
+#
+# PROVISIONAL ALLOCATION: the indices follow the canonical layout
+# marox-cyber proposed on issue #47 (comment 7144520482) — i28 allowance,
+# i29 refund delay, i32 expiry, with i27 left to the two-stream block
+# hold — but Bounty 01 has not frozen the condition-record layout yet.
+# If the maintainers allocate differently, these three constants move
+# and nothing else changes. In this tree today i28/i29/i32 are
+# unassigned: they sit inside the custom-input space (i26+), which is
+# exactly why they join i17/i16 under the reserve-when-fed rule below —
+# reserved for writing, and readable only from a registered o5 clause,
+# exactly while the gate feeds them. The normalisation is the one the
+# layout's author documented (allowance scaled to 30 days by integer
+# floor division); the floor means an allowance below one unit per
+# 30 days normalises to 0 and reads as "no allowance".
+ALLOWANCE_STREAM_INDEX = 28
+REFUND_DELAY_STREAM_INDEX = 29
+EXPIRY_STREAM_INDEX = 32
+SECONDS_PER_30_DAYS = 2_592_000
+
+
+def recipient_fact_indices() -> tuple:
+    """The condition-fact stream indices (parts 3-4), low to high."""
+    return (ALLOWANCE_STREAM_INDEX, REFUND_DELAY_STREAM_INDEX,
+            EXPIRY_STREAM_INDEX)
+
 # Rule-text screening contexts. Slots are readable in exactly one of them.
 RULE_TEXT_CONTEXT_USER = "user_rule"
 RULE_TEXT_CONTEXT_O5_CLAUSE = "o5_clause"
@@ -419,6 +466,7 @@ def reserved_operation_keys(
         keys = keys + approval_slot_indices()
     if recipient_policy_active:
         keys = keys + (HOLD_STREAM_INDEX, CONTEXT_STREAM_INDEX)
+        keys = keys + recipient_fact_indices()
     return keys
 
 
@@ -450,4 +498,5 @@ def rule_text_forbidden_input_streams(
         readable |= set(approval_slot_indices())
         if recipient_policy_active:
             readable |= {HOLD_STREAM_INDEX, CONTEXT_STREAM_INDEX}
+            readable |= set(recipient_fact_indices())
     return tuple(f"i{idx}" for idx in keys if idx not in readable)

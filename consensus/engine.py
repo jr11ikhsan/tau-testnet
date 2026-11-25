@@ -2058,14 +2058,18 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     int(block_height or 0),
                                     int(block_timestamp or 0),
                                 )
+                                recip_facts = sender_policy.condition_facts(
+                                    park.terms)
                             else:
                                 hold, context = 0, tau_defs.CONTEXT_INCOMING_FINAL
+                                recip_facts = None
                             recip_blocks, recip_info = \
                                 sender_policy.recipient_clause_blocks(
                                     lifecycle_mgr.rule_offers.clause_for,
                                     to_addr, tau_input_stream_values,
                                     hold=hold, context=context, pool="apply",
                                     timeout=getattr(_session, "request_budget", None),
+                                    facts=recip_facts,
                                 )
                             if recip_blocks:
                                 logger.info(
@@ -2082,7 +2086,29 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     k: v for k, v in recip_info.items()
                                     if k != "o5"
                                 }
-                                if recip_info["reason"] == "recipient_max_hold":
+                                if recip_info["reason"] in (
+                                        "recipient_allowance_limit",
+                                        "recipient_refund_delay",
+                                        "recipient_expiry",
+                                        "recipient_condition_block"):
+                                    # Same persisted-detail contract as the
+                                    # hold line below: the measured fact
+                                    # always, a cap only when verified.
+                                    log_line = (
+                                        "Transfer rejected by recipient policy "
+                                        f"({recip_info['reason']}, "
+                                        f"o5={recip_info.get('o5')}): "
+                                        f"allowance_30d={recip_info.get('allowance_30d')} "
+                                        f"refund_delay={recip_info.get('refund_delay')} "
+                                        f"expiry_seconds={recip_info.get('expiry_seconds')} "
+                                        f"cap_kind={recip_info.get('cap_kind')}"
+                                    )
+                                    if recip_info.get("cap_kind") == "threshold":
+                                        log_line += (
+                                            f" max_allowance_30d="
+                                            f"{recip_info.get('max_allowance_30d')}"
+                                        )
+                                elif recip_info["reason"] == "recipient_max_hold":
                                     # The log line is the persisted detail
                                     # trail for a dropped tx, so it carries
                                     # the measured fields in key=value form:
@@ -2129,6 +2155,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 guarded_values = sender_policy.guarded_pass_inputs(
                                     tau_input_stream_values, to_addr,
                                     hold=hold, context=context,
+                                    facts=recip_facts,
                                 )
                                 with tau_manager.tau_comm_lock:
                                     guarded_outputs = _session.evaluate(

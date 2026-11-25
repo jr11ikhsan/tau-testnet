@@ -529,7 +529,8 @@ def _sender_clause_blocks(tip_view, sender_pubkey, values, budget):
 
 
 def _recipient_gate_refusal(tip_view, recipient_pubkey, values, *, hold, context,
-                            budget, transfer_details, transfer_index):
+                            budget, transfer_details, transfer_index,
+                            facts=None):
     """The rejection envelope when the recipient's own policy refuses one
     transfer, or None when it does not.
 
@@ -538,14 +539,35 @@ def _recipient_gate_refusal(tip_view, recipient_pubkey, values, *, hold, context
     admission and apply never disagree: an allow-list refusal is a plain
     TX_REJECTED; a hold refusal carries the RECIPIENT_MAX_HOLD code with the
     measured hold and — only when the gate verified it against this payer's
-    own evaluation — the recipient's actual cap.
+    own evaluation — the recipient's actual cap. A condition-fact refusal
+    (parts 3-4) carries its own code with the measured fact, and for the
+    allowance the verified cap under the same rule.
     """
     blocked, info = _policy_call(lambda: sender_policy.recipient_clause_blocks(
         tip_view.clause_for, recipient_pubkey, values,
         hold=hold, context=context, pool="admission", timeout=budget,
+        facts=facts,
     ))
     if not blocked:
         return None
+    if info.get("reason") in (
+            "recipient_allowance_limit", "recipient_refund_delay",
+            "recipient_expiry", "recipient_condition_block"):
+        details = {
+            k: v for k, v in info.items()
+            if k not in ("o5", "recipient", "reason")
+        }
+        code = info.get("code") or "RECIPIENT_CONDITION_BLOCK"
+        return _qt_err(
+            code,
+            (
+                f"Transaction rejected: the recipient's policy refused "
+                f"transfer #{transfer_index} ({transfer_details}) on its "
+                f"condition terms ({code}). Policy output: {info.get('o5')}"
+            ),
+            transfer_index=transfer_index,
+            recipient_policy=details,
+        )
     if info.get("reason") == "recipient_max_hold":
         details = {
             "code": "RECIPIENT_MAX_HOLD",
@@ -1399,8 +1421,16 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     tip_view.next_block_height,
                                     tip_view.next_block_timestamp,
                                 )
+                                recip_facts = {
+                                    int(idx): value
+                                    for idx, value in (
+                                        admission_eval.data.get(
+                                            "condition_facts") or {}
+                                    ).items()
+                                }
                             else:
                                 recip_hold, recip_context = 0, tau_defs.CONTEXT_INCOMING_FINAL
+                                recip_facts = None
                             refusal = _recipient_gate_refusal(
                                 tip_view, tau_input_dict['to_addr'],
                                 tau_input_stream_values,
@@ -1408,6 +1438,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                 budget=admission_tau.budget,
                                 transfer_details=transfer_details,
                                 transfer_index=i + 1,
+                                facts=recip_facts,
                             )
                             if refusal is not None:
                                 return refusal
@@ -1424,6 +1455,7 @@ def _queue_transaction(json_blob: str, propagate: bool, *, dry_run: bool,
                                     tau_input_stream_values,
                                     tau_input_dict['to_addr'],
                                     hold=recip_hold, context=recip_context,
+                                    facts=recip_facts,
                                 )
                                 guarded_outputs = admission_tau.step_multi(
                                     guarded_values, source=sender_pubkey,
