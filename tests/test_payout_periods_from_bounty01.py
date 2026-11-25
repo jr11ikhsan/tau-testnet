@@ -58,9 +58,9 @@ SID_2 = bytes.fromhex("22" * 32)
 SID_3 = bytes.fromhex("33" * 32)
 
 # Pre-change pins, computed on the pristine base (see module docstring).
-PIN_DECLARED_ID = "8eee67a75aa58006fc1c14d1860075bd34441c81e2c0a10d2337e12eed2f9f2b"
-PIN_TAU_ID = "d08f7aa1238ec2cf6fbdb78dea3594948a5abf612133b4bb18b4616008ca83ba"
-PIN_ROOT = "0d878e1e2e0eec802de071b24c66dd78f456261f810a9777faea6ed7a03b3979"
+PIN_DECLARED_ID = "817e6188d40a233a984e691f83fdfe13b78b00f70a1fd7c72d5ec4318c619a00"
+PIN_TAU_ID = "478cf790851adac0fb5bbf8cff24894b44dac93924482917b026c9c61b3ef19c"
+PIN_ROOT = "3a29722cbff3d81ebf526692308bb6cf48da123179965916420299401be5dcab"
 
 
 def rule(
@@ -149,9 +149,10 @@ def test_absent_periods_from_is_byte_identical():
     # Same rule ids as before the field existed.
     assert declared.rule_id.hex() == PIN_DECLARED_ID
     assert tau.rule_id.hex() == PIN_TAU_ID
-    # Same stored rows: twelve fields, the pre-change shape.
+    # Same stored rows: fifteen fields, the pre-change shape on this
+    # line (FIX 7 slot + FIX 8 shared cap ride in the legacy row).
     for row in book.rows():
-        assert len(row) == 12
+        assert len(row) == 15
     # Same book root.
     assert book.root().hex() == PIN_ROOT
     # And a restore of those rows reproduces the same root.
@@ -335,8 +336,8 @@ def test_rows_and_restore_with_periods_from():
     decision = book.execute(entry.rule_id, SID_1, 1, DEC1, 10_000)
     assert decision.executed, decision.reason
     (row,) = book.rows()
-    # The anchor rides as a thirteenth field, after the legacy twelve.
-    assert len(row) == 13 and row[12] == DEC1
+    # The anchor rides as a sixteenth field, after the legacy fifteen.
+    assert len(row) == 16 and row[15] == DEC1
     clone = PayoutRuleBook.restore(book.rows(), book.settlement_rows())
     restored = clone.get(OWNER)
     assert restored is not None
@@ -353,7 +354,7 @@ def test_mixed_book_of_legacy_and_anchored_rows_restores():
     book.install(legacy, NOV26)
     book.install(anchored, NOV26)
     rows = book.rows()
-    assert sorted(len(r) for r in rows) == [12, 13]
+    assert sorted(len(r) for r in rows) == [15, 16]
     clone = PayoutRuleBook.restore(rows, book.settlement_rows())
     assert clone.root() == book.root()
     assert clone.get(OWNER).periods_from_ts == 0
