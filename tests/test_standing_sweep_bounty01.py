@@ -30,6 +30,9 @@ Covered here, at engine level with full calendar control:
     forever (no unsigned catch-up) while the next period pays;
 (7) the per-block cap: 17 due authorizations settle 16 in the first
     block — earliest due first — and the last one in the next block.
+(8) the o5 gate (coordinator decision (i)): while the payer's own policy
+    blocks, the sweep settles nothing and advances no marker; once the
+    policy allows, the same period settles exactly once, fee-free.
 """
 import copy
 import hashlib
@@ -453,3 +456,36 @@ def test_sweep_settles_at_most_sixteen_per_block_earliest_due_first():
     assert event["auth_id"] == auth_ids[16].hex()
     assert _book(chain).total_executed(auth_ids[16]) == (1, AMOUNT)
     assert chain.balances[RECIPIENT] == 17 * AMOUNT
+
+
+# --- (8) the o5 gate: a blocked sweep settles nothing, then settles once ------
+
+def test_o5_blocked_sweep_settles_nothing_then_settles_once():
+    """Decision (i): the payer's own policy gates the sweep itself.
+
+    The mirror of the transaction pin (#34-7): while the policy blocks,
+    an empty block settles nothing and advances no marker; once the policy
+    allows, the same period settles exactly once, fee-free, through the
+    sweep alone.
+    """
+    chain, auth_id = _created_chain(BASE - 1000, anchor_ts=BASE,
+                                    window_seconds=3600)
+    payer_after_create = chain.balances[PAYER]
+
+    chain.ts = BASE + 100
+    result = chain.apply([], allow=False)
+    assert _swept_events(result) == []
+    assert chain.balances[PAYER] == payer_after_create
+    assert chain.balances[RECIPIENT] == 1000
+    assert _book(chain).total_executed(auth_id) == (0, 0)
+    assert _book(chain).facts_for(auth_id) == []
+
+    chain.ts = BASE + 200
+    result = chain.apply([])
+    (event,) = _swept_events(result)
+    assert event["auth_id"] == auth_id.hex()
+    assert event["amount"] == AMOUNT
+    assert event["period_index"] == 0
+    assert _book(chain).total_executed(auth_id) == (1, AMOUNT)
+    assert chain.balances[RECIPIENT] == 1000 + AMOUNT
+    assert chain.balances[PAYER] == payer_after_create - AMOUNT

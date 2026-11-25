@@ -11,6 +11,13 @@ class TauExecutionResult(NamedTuple):
     accepted_transactions: List[Dict[str, Any]]
     rejected_transactions: List[Dict[str, Any]]
     receipts: Dict[str, Any]
+    # Bound o5 gate for the end-of-block due sweep, when this result comes
+    # from the consensus engine's apply: a callable
+    # (payer, recipient, amount) -> bool, True when the payer's own policy
+    # allows that transfer. None for results that carry no gate (the mock
+    # engine; any apply path that never sweeps). Optional and last, so
+    # existing positional construction keeps working.
+    sweep_policy_gate: Any = None
 
 
 class TauEngine(Protocol):

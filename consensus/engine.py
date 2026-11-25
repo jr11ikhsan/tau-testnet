@@ -374,9 +374,39 @@ def _refund_expired_grants(lm, balances, sequences, timestamp) -> List[Dict[str,
     return events
 
 
+def _policy_allows_from_tau_outputs(outputs, lifecycle_mgr, from_addr, inputs, session) -> bool:
+    """The o5 verdict for one transfer, from one Tau multi result. ONE definition.
+
+    Read from the SAME multi result the transfer was judged on (no extra
+    roundtrip, no perturbation), mirroring admission (commands/sendtx.py).
+    Semantics: o5 absent -> allow; present and == BLOCK (0) -> block; a
+    malformed policy output fails closed (parse_tau_output maps unparseable
+    -> 0 -> block). When the stream allows, the sender's own policy clause
+    is re-checked over the same inputs. Shared by the parked-transfer
+    measurement and by the due-sweep gate, so both judge a transfer by the
+    same verdict; the execution seam states the same rule inline where the
+    transfer is executed (with its receipt reasons and logging).
+    """
+    o5_raw = outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+    allows = not (
+        o5_raw is not None
+        and tau_manager.parse_tau_output(o5_raw)
+        == tau_defs.USER_POLICY_BLOCK_VALUE
+    )
+    if allows:
+        own_blocks, _own_o5 = sender_policy.clause_blocks(
+            lifecycle_mgr.rule_offers.clause_for(
+                from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
+            inputs, pool="apply",
+            timeout=getattr(session, "request_budget", None),
+        )
+        allows = not own_blocks
+    return allows
+
+
 def _settle_due_standing_payments(
     lm, balances, sequences, timestamp, last_transfer_ts=None,
-    eligible_ids=None,
+    eligible_ids=None, policy_gate=None,
 ) -> List[Dict[str, Any]]:
     """Settle due standing-payment periods node-side; returns the events.
 
@@ -405,6 +435,18 @@ def _settle_due_standing_payments(
     committed, so an authorization is never settled in the block that
     installed it — the transaction loop owns its own block, and an
     execution or cancellation in the install block is never pre-empted.
+
+    `policy_gate` is the payer's own o5 gate for this block (decision
+    (i)): a callable (payer, recipient, amount) -> bool, True when the
+    policy allows that transfer, bound by apply() to the block's session
+    and frozen inputs — the same measurement the approval path uses, not
+    a second implementation. The gate is consulted BEFORE execute(),
+    against the amount the non-mutating preview (`execution_due`) says
+    the settlement would move, because execute() mutates on success: a
+    blocked settlement must advance no marker. A blocked candidate does
+    not consume one of the 16 slots and is a candidate again next block,
+    exactly like an authorization whose payer cannot pay. When no gate is
+    supplied the sweep fails closed and settles nothing.
     """
     book = _standing_payment_book(lm)
     if book is None:
@@ -412,15 +454,30 @@ def _settle_due_standing_payments(
     events: List[Dict[str, Any]] = []
     grant = faucet.amount(lm)
     settled = 0
+    if policy_gate is None:
+        logger.warning(
+            "Due sweep has no policy gate: settling nothing this block "
+            "(fail-closed under decision (i))."
+        )
+        return events
     for entry in book.due_sweep_candidates(int(timestamp), eligible_ids):
         if settled >= MAX_DUE_SWEEP_SETTLEMENTS_PER_BLOCK:
             break
+        payer_balance = int(balances.get(entry.payer_pubkey, 0))
+        preview = book.execution_due(entry.auth_id, int(timestamp), payer_balance)
+        if not preview.executed:
+            continue
+        if not policy_gate(entry.payer_pubkey, entry.recipient_pubkey, preview.amount):
+            continue
         decision = book.execute(
             entry.auth_id,
             int(timestamp),
-            int(balances.get(entry.payer_pubkey, 0)),
+            payer_balance,
         )
         if not decision.executed:
+            # Unreachable by construction: the preview and the settlement
+            # run the same evaluation with no state change between them.
+            # Kept as a guard so a divergence can never move balances.
             continue
         balances[entry.payer_pubkey] = (
             int(balances.get(entry.payer_pubkey, 0)) - decision.amount
@@ -1130,6 +1187,11 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         settled_standing = _settle_due_standing_payments(
             lm, t_bals, t_seqs, block.header.timestamp, t_lts,
             eligible_ids=standing_ids_at_block_start,
+            # The o5 gate bound by apply() to this block's session and
+            # frozen inputs (decision (i)): the sweep settles only what the
+            # payer's own policy allows. A missing gate fails closed inside
+            # the sweep (it settles nothing) rather than settling ungated.
+            policy_gate=getattr(exec_result, "sweep_policy_gate", None),
         )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
@@ -1813,6 +1875,85 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
             return lifecycle_mgr
 
+        def _transfer_input_map(from_addr, to_addr, amount,
+                                slot_values=None, overrides=None):
+            """The per-transfer Tau input map. ONE definition, on purpose.
+
+            The overlay ORDER is load-bearing (tau_defs documents it): the
+            same keys in the same sequence must be built at mempool
+            admission and at block apply, or a rule combining a custom
+            stream with the transfer fields is enforced differently on the
+            two paths. Every apply-side caller -- an ordinary transfer, a
+            parked-transfer fee measurement, a released transfer -- goes
+            through here so there is nothing to keep in step by hand.
+            """
+            values = {
+                1: str(amount),
+                # i2 (balance) at the PARENT snapshot: frozen for
+                # the whole block, so proposer and verifier read
+                # the same value and a balance-reading policy rule
+                # is deterministic across both (issue #20).
+                2: _parent_bal(from_addr),
+                **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
+                # i3/i4 are the real from/to pubkeys (immutable in
+                # the transfer tuple -> identical at admission and
+                # apply), so recipient-aware policy/fee rules are
+                # deterministic across the two.
+                3: "{ #x" + str(from_addr) + " }:bv[384]",
+                4: "{ #x" + str(to_addr) + " }:bv[384]",
+            }
+            values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
+            for k, v in (overrides or {}).items():
+                values[k] = v
+            # Approval slots, fed after the custom merge and before i5,
+            # byte-identically to the admission overlay order in
+            # commands/sendtx.py. Reserved, so a sender cannot pre-fill one.
+            for slot, slot_val in (slot_values or {}).items():
+                values[slot] = slot_val
+            values[5] = str(block_timestamp)
+            return values
+
+        def _due_sweep_policy_gate(from_addr, to_addr, amount) -> bool:
+            """The o5 gate for one node-made due settlement (decision (i)).
+
+            True exactly when the payer's own policy allows THIS transfer
+            -- same payer, same recipient, same amount, judged by one Tau
+            step over the same input map (`_transfer_input_map`, hoisted to
+            this level so the gate is bound even for an empty block) and the
+            same verdict (`_policy_allows_from_tau_outputs`, one definition
+            shared with the parked-transfer measurement). No approver slots
+            are fed (the empty map, as on the ordinary path with no votes),
+            because the sweep carries no votes; and no custom inputs,
+            because it carries no signed custom inputs. The fee is not
+            measured: the sweep charges none.
+
+            Bound before the transaction loop so the gate closes over the
+            block's own session, frozen parent inputs and lifecycle; it is
+            handed to the end-of-block sweep through the apply result. In a
+            Tau-less replay it returns False (the same concession the
+            transfer path makes), so the sweep settles nothing there.
+            """
+            inputs = _transfer_input_map(
+                from_addr, to_addr, amount,
+                slot_values={}, overrides=None,
+            )
+            if not _session.ready(timeout=5):
+                if replay_mode:
+                    logger.warning(
+                        "Replay without Tau: due sweep assumed blocked.",
+                    )
+                    return False
+                raise FeeRuleError(
+                    "Tau unavailable measuring a due sweep settlement"
+                )
+            with tau_manager.tau_comm_lock:
+                outputs = _session.evaluate(
+                    inputs, multi=True, apply_rules_update=False,
+                )
+            return _policy_allows_from_tau_outputs(
+                outputs, lifecycle_mgr, from_addr, inputs, _session,
+            )
+
         for i, tx in enumerate(transactions):
             # One branch per transaction. Its journal child, allocator child and
             # state delta resolve together; a rejection that already stepped the
@@ -2098,44 +2239,6 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 )
                 return True
 
-            def _transfer_input_map(from_addr, to_addr, amount,
-                                    slot_values=None, overrides=None):
-                """The per-transfer Tau input map. ONE definition, on purpose.
-
-                The overlay ORDER is load-bearing (tau_defs documents it): the
-                same keys in the same sequence must be built at mempool
-                admission and at block apply, or a rule combining a custom
-                stream with the transfer fields is enforced differently on the
-                two paths. Every apply-side caller -- an ordinary transfer, a
-                parked-transfer fee measurement, a released transfer -- goes
-                through here so there is nothing to keep in step by hand.
-                """
-                values = {
-                    1: str(amount),
-                    # i2 (balance) at the PARENT snapshot: frozen for
-                    # the whole block, so proposer and verifier read
-                    # the same value and a balance-reading policy rule
-                    # is deterministic across both (issue #20).
-                    2: _parent_bal(from_addr),
-                    **({16: _since_last_transfer(from_addr)} if cooldown_active else {}),
-                    # i3/i4 are the real from/to pubkeys (immutable in
-                    # the transfer tuple -> identical at admission and
-                    # apply), so recipient-aware policy/fee rules are
-                    # deterministic across the two.
-                    3: "{ #x" + str(from_addr) + " }:bv[384]",
-                    4: "{ #x" + str(to_addr) + " }:bv[384]",
-                }
-                values[12] = "{ #x" + str(from_addr) + " }:bv[384]"
-                for k, v in (overrides or {}).items():
-                    values[k] = v
-                # Approval slots, fed after the custom merge and before i5,
-                # byte-identically to the admission overlay order in
-                # commands/sendtx.py. Reserved, so a sender cannot pre-fill one.
-                for slot, slot_val in (slot_values or {}).items():
-                    values[slot] = slot_val
-                values[5] = str(block_timestamp)
-                return values
-
             def _measure_parked_transfer(from_addr, to_addr, amount, overrides,
                                          slot_values):
                 """One Tau step for a parked transfer: (policy_allows, fee).
@@ -2169,22 +2272,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     outputs = _session.evaluate(
                         inputs, multi=True, apply_rules_update=False,
                     )
-                # o5 semantics, identical to the transfer path: absent -> allow,
-                # BLOCK -> block, unparseable -> 0 -> block (fails closed).
-                o5_raw = outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
-                allows = not (
-                    o5_raw is not None
-                    and tau_manager.parse_tau_output(o5_raw)
-                    == tau_defs.USER_POLICY_BLOCK_VALUE
+                # o5 verdict, one definition (module level): absent -> allow,
+                # BLOCK -> block, unparseable -> 0 -> block (fails closed),
+                # then the payer's own clause re-check.
+                allows = _policy_allows_from_tau_outputs(
+                    outputs, lifecycle_mgr, from_addr, inputs, _session,
                 )
-                if allows:
-                    own_blocks, _own_o5 = sender_policy.clause_blocks(
-                        lifecycle_mgr.rule_offers.clause_for(
-                            from_addr, tau_defs.USER_POLICY_STREAM_INDEX),
-                        inputs, pool="apply",
-                        timeout=getattr(_session, "request_budget", None),
-                    )
-                    allows = not own_blocks
                 fee = fees.parse_consensus_fee(
                     outputs.get(tau_defs.CONSENSUS_FEE_STREAM_INDEX),
                     context=f"tx {tx_id} parked",
@@ -4374,4 +4467,10 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             accepted_transactions=accepted_txs,
             rejected_transactions=rejected_txs,
             receipts=receipts,
+            # The o5 gate for the end-of-block due sweep: the same policy
+            # measurement the approval path uses, bound to this block's
+            # session and frozen inputs. `_apply_block` hands it to the
+            # sweep; any other caller of apply() simply ignores it (no
+            # sweep runs there).
+            sweep_policy_gate=_due_sweep_policy_gate,
         )

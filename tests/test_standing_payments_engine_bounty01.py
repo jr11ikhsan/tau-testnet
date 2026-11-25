@@ -291,6 +291,12 @@ def test_cancel_by_payer_blocks_execution_and_cancel_by_stranger_fails():
     result = chain.apply([stranger])
     assert stranger["tx_id"] in result.invalid_tx_ids
     assert _book(chain).status(auth_id, TS) == "active"
+    # FIX-3 node sweep: the due period settles at the end of this block even
+    # though its only transaction failed — settlement no longer waits for an
+    # executor transaction. The stranger still cannot cancel anything.
+    assert _book(chain).total_executed(auth_id) == (1, AMOUNT)
+    (swept,) = result.next_snapshot.metadata["standing_payment_events"]
+    assert swept["action"] == "executed" and swept["swept"] is True
 
     cancel = _cancel_tx(PAYER, SK_PAYER, auth_id, seq=1)
     result = chain.apply([cancel])
@@ -302,7 +308,9 @@ def test_cancel_by_payer_blocks_execution_and_cancel_by_stranger_fails():
     execute = _execute_tx(EXECUTOR, SK_EXECUTOR, auth_id, seq=0)
     result = chain.apply([execute])
     assert execute["tx_id"] in result.invalid_tx_ids
-    assert _book(chain).total_executed(auth_id) == (0, 0)
+    # The one settlement is the sweep's from the stranger block; the cancel
+    # itself settled nothing further, and no execution can follow it.
+    assert _book(chain).total_executed(auth_id) == (1, AMOUNT)
 
 
 def test_cancel_of_unknown_id_is_refused():
@@ -458,15 +466,24 @@ def test_payer_self_execution_above_the_fee_limit_is_refused():
     own = _execute_tx(PAYER, SK_PAYER, auth_id, seq=1)
     result = chain.apply([own])
     assert own["tx_id"] in result.invalid_tx_ids
-    assert chain.balances[PAYER] == payer_after_create  # nothing moved, no fee
-    assert _book(chain).total_executed(auth_id) == (0, 0)
+    # The self-execution is refused as a transaction (the fee it would
+    # charge exceeds the signed limit), and it charges no fee. But the
+    # FIX-3 node sweep settles the due period fee-free in the same block:
+    # the limit caps the fee the payer funds, not whether the scheduled
+    # payment happens — and the sweep charges no fee at all.
+    assert chain.balances[PAYER] == payer_after_create - AMOUNT
+    assert _book(chain).total_executed(auth_id) == (1, AMOUNT)
+    (swept,) = result.next_snapshot.metadata["standing_payment_events"]
+    assert swept["action"] == "executed" and swept["swept"] is True
 
-    # A third party can still execute; the payer funds only up to 3 of the 7.
+    # A third party can still execute the NEXT period; the payer funds only
+    # up to 3 of the 7 fee, exactly as before.
+    chain.ts = TS + 86400
     other = _execute_tx(EXECUTOR, SK_EXECUTOR, auth_id, seq=0)
     result = chain.apply([other])
     assert other["tx_id"] in result.accepted_tx_ids
     assert chain.balances[EXECUTOR] == 1000 - (FEE - 3)
-    assert chain.balances[PAYER] == payer_after_create - AMOUNT - 3
+    assert chain.balances[PAYER] == payer_after_create - 2 * AMOUNT - 3
     (event,) = result.next_snapshot.metadata["standing_payment_events"]
     assert event["fee_reimbursed"] == 3
 
