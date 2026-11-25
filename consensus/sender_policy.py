@@ -165,7 +165,10 @@ def condition_facts(terms) -> dict:
     which is each stream's "no condition" value (no allowance cap, never
     refundable / no refund term, never expires). The allowance is fed
     normalised to a 30-day rate — the exact integer normalisation in
-    `consensus.retractable.normalize_allowance_30d`.
+    `consensus.retractable.normalize_allowance_30d`. The refund delay is
+    fed ENCODED: a delay of N seconds feeds 1+N (0 = never refundable,
+    1 = refundable at once) — the same encoding the gate decodes, so a
+    clause reading i29 sees the encoded value, never the raw seconds.
     """
     facts = {idx: 0 for idx in tau_defs.recipient_fact_indices()}
     if terms is None:
@@ -176,7 +179,7 @@ def condition_facts(terms) -> dict:
         facts[tau_defs.ALLOWANCE_STREAM_INDEX] = normalize_allowance_30d(
             terms.allowance_amount, terms.allowance_period_seconds)
     if terms.refund_delay is not None:
-        facts[tau_defs.REFUND_DELAY_STREAM_INDEX] = int(terms.refund_delay)
+        facts[tau_defs.REFUND_DELAY_STREAM_INDEX] = int(terms.refund_delay) + 1
     if terms.expiry_seconds is not None:
         facts[tau_defs.EXPIRY_STREAM_INDEX] = int(terms.expiry_seconds)
     return facts

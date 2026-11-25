@@ -177,6 +177,7 @@ def test_parse_condition_terms_absent_and_present():
     {"allowance_amount": 2 ** 64 - 1, "allowance_period_seconds": 1},
     {"refund_delay": -1},
     {"refund_delay": "1801"},
+    {"refund_delay": 2 ** 64 - 1},  # encoded fact (delay + 1) would overflow bv[64]
     {"expiry_seconds": 2 ** 64},
 ])
 def test_parse_condition_terms_malformed_fails_closed(bad):
@@ -191,9 +192,14 @@ def test_condition_facts_mapping():
         ALLOWANCE: 0, REFUND: 0, EXPIRY: 0}
     facts = sender_policy.condition_facts(
         ConditionTerms(500, 604_800, 1801, 90_000))
-    assert facts == {ALLOWANCE: 2_142, REFUND: 1801, EXPIRY: 90_000}
+    # The refund delay is fed ENCODED: 1801 seconds -> fact 1802
+    # (0 = never, 1 = at once, 1+N = after N seconds).
+    assert facts == {ALLOWANCE: 2_142, REFUND: 1802, EXPIRY: 90_000}
     assert sender_policy.condition_facts(ConditionTerms()) == {
         ALLOWANCE: 0, REFUND: 0, EXPIRY: 0}
+    # A zero-second delay encodes to 1 (refundable at once), never to 0.
+    assert sender_policy.condition_facts(
+        ConditionTerms(None, None, 0, None))[REFUND] == 1
 
 
 # --- the overlay forces the facts, in every key shape ------------------------

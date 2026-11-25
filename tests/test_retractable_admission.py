@@ -117,6 +117,25 @@ def test_a_well_formed_height_park_is_admitted(tip_view):
         "recipient_pubkey": B,
         "release_kind": KIND_HEIGHT,
         "release_at": NEXT_HEIGHT + 30,
+        # B03FIX3: admission reports the judged condition facts; a park
+        # with no terms feeds 0 on every fact stream (no condition).
+        "condition_facts": {"28": 0, "29": 0, "32": 0},
+    }
+
+
+def test_a_park_with_terms_reports_its_condition_facts(tip_view):
+    tx = park(
+        allowance_amount=500,
+        allowance_period_seconds=604800,  # weekly 500 -> 2,142 per 30d
+        refund_delay=7200,
+        expiry_seconds=3600,
+    )
+    result = validate_mempool_admission(tx, tip_view)
+    assert result.is_valid is True, result.error
+    assert result.data["condition_facts"] == {
+        "28": 2142,
+        "29": 7201,
+        "32": 3600,
     }
 
 

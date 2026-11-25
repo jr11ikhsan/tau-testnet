@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import bisect
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import tau_defs
@@ -65,8 +65,10 @@ class RetractableShapeError(ValueError):
 class ConditionTerms:
     """The conditions a park's sender attaches to the payment (Bounty 03
     parts 3-4): an optional spending allowance (amount per period), an
-    optional encoded refund delay, an optional expiry. Every field None
-    means the payment carries no such term.
+    optional refund delay in SECONDS, an optional expiry. Every field None
+    means the payment carries no such term. The refund delay is stored
+    raw (seconds) here; the node feeds it ENCODED on i29 (delay + 1:
+    0 = never, 1 = at once) — see `sender_policy.condition_facts`.
 
     Judged exactly once, by the recipient gate, when the park is created;
     a release or retract is never re-judged, so the terms are not part of
@@ -86,7 +88,11 @@ class RetractableEntry:
     sequence_number: int
     kind: int
     release_at: int
-    terms: Optional[ConditionTerms] = None
+    # Always a ConditionTerms object, never None: absence of terms is
+    # "all fields None", so an entry built by parsing a tx and one rebuilt
+    # by RetractableBook.restore compare equal (B03FIX3: the two
+    # representations used to differ and broke reorg restart equality).
+    terms: ConditionTerms = field(default_factory=ConditionTerms)
 
     @property
     def retractable_id(self) -> bytes:
@@ -169,10 +175,18 @@ def parse_condition_terms(tx: Dict[str, Any]) -> ConditionTerms:
             raise RetractableShapeError(
                 "allowance normalises past the bv[64] fact stream"
             )
+    delay = _optional_u64_field(tx, "refund_delay")
+    if delay == _U64_MAX:
+        # The fact stream carries the ENCODED delay (delay + 1: 0 = never,
+        # 1 = at once, 1+N = after N seconds), so the largest raw delay
+        # would not fit bv[64] once encoded.
+        raise RetractableShapeError(
+            "refund_delay must be below 2**64 - 1 (the encoded fact must fit bv[64])"
+        )
     return ConditionTerms(
         allowance_amount=amount,
         allowance_period_seconds=period,
-        refund_delay=_optional_u64_field(tx, "refund_delay"),
+        refund_delay=delay,
         expiry_seconds=_optional_u64_field(tx, "expiry_seconds"),
     )
 
