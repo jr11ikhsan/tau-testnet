@@ -198,6 +198,70 @@ def cmd_governance(args: argparse.Namespace) -> int:
     return _simple_query(args, "getgovernance")
 
 
+def _short_pubkey(pubkey: str) -> str:
+    return pubkey[:10] + "..." if len(pubkey) > 13 else pubkey
+
+
+def _format_fee_rules(data: dict) -> str:
+    """Human-readable fee_rules view (issue #42, bounty 02).
+
+    One line per accepted unit that writes the fee stream o8, whoever
+    sent it, in the order the units joined -- the same rows
+    `getrulesinforce` serves as `fee_rules`.
+    """
+    if not isinstance(data, dict) or not data.get("available"):
+        lines = ["fee rules (o8): not available"]
+        if isinstance(data, dict) and data.get("message"):
+            lines.append(f"  {data['message']}")
+        return "\n".join(lines)
+    fees = data.get("fee_rules") or []
+    lines = [
+        "fee rules (o8) of every account, any of which can change "
+        f"this account's fee: {len(fees)}"
+    ]
+    if data.get("fee_rules_as_of"):
+        lines.append(f"  as of: {data['fee_rules_as_of']}")
+    for row in fees:
+        sender = row.get("sent_by")
+        who = _short_pubkey(sender) if sender else "sender not recorded"
+        mine = "  names this account" if row.get("names_this_account") else ""
+        status = row.get("status") or "unknown"
+        since = row.get("since") or {}
+        lines.append(
+            f"  sha256 {row.get('sha256')}  sent by {who}{mine}  "
+            f"[{status}]  block {since.get('block_number')}"
+        )
+        if row.get("displaced_by"):
+            lines.append(
+                "    displaced by: "
+                + ", ".join(_short_pubkey(t) for t in row["displaced_by"])
+            )
+    return "\n".join(lines)
+
+
+def cmd_fee_rules(args: argparse.Namespace) -> int:
+    """List the fee rules (o8) in force, with who sent each one."""
+    command = "getrulesinforce"
+    if args.account:
+        command += f" {args.account}"
+    if args.height is not None:
+        command += f" {args.height}"
+    response = _send(args, command)
+    if rpc_mod.is_error_response(response):
+        if args.json:
+            print_result({"error": response}, json_mode=True)
+        else:
+            print(response)
+        return EXIT_APP_ERROR
+    parsed = parse_json_response(response)
+    if args.json:
+        print_result(parsed, json_mode=True)
+        return EXIT_OK
+    data = parsed.get("data", {}) if isinstance(parsed, dict) else {}
+    print(_format_fee_rules(data))
+    return EXIT_OK
+
+
 def cmd_update_id(args: argparse.Namespace) -> int:
     try:
         payload_obj = _load_json_payload(args)
@@ -1192,6 +1256,22 @@ def build_parser() -> argparse.ArgumentParser:
     # governance
     p_gov = sub.add_parser("governance", parents=common, help="Inspect node governance state")
     p_gov.set_defaults(func=cmd_governance)
+
+    # fee-rules
+    p_fee = sub.add_parser(
+        "fee-rules",
+        parents=common,
+        help="List the fee rules (o8) in force, with who sent each one",
+    )
+    p_fee.add_argument(
+        "account", nargs="?", default=None,
+        help="Account public key (hex); marks the rows that name it",
+    )
+    p_fee.add_argument(
+        "height", nargs="?", type=int, default=None,
+        help="Block height the rules are in force at (default: tip)",
+    )
+    p_fee.set_defaults(func=cmd_fee_rules)
 
     # update-id
     p_update = sub.add_parser(

@@ -365,6 +365,38 @@ tau-testnet governance
 tau-testnet --json governance | jq '.pending_updates'
 ```
 
+### Fee rules
+
+List every accepted unit that writes the fee stream o8, whoever sent
+it — the rules that can change what an account pays, including rules
+sent by other accounts (#183). One line per unit, in the order the
+units joined. See [rules_in_force.md](rules_in_force.md) for the full
+field list and the limits of the view (node-local record, `sent_by`
+null for genesis / pre-recording units).
+
+```bash
+tau-testnet fee-rules
+tau-testnet fee-rules <pubkey-hex>        # marks the rows that name this account
+tau-testnet fee-rules <pubkey-hex> 42     # as of block 42, not the tip
+tau-testnet --json fee-rules
+```
+
+Output (one row per fee unit):
+
+```text
+fee rules (o8) of every account, any of which can change this account's fee: 2
+  as of: this block
+  sha256 <sha256>  sent by 86d784eaa7...  names this account  [in_force]  block 1
+  sha256 <sha256>  sent by sender not recorded  [displaced]  block 2
+    displaced by: <tx-hash-prefix>...
+```
+
+`[displaced]` rows no longer change what anyone pays; they stay
+listed so a live fee rule is distinguishable from a replaced one.
+The command sends `getrulesinforce [account] [height]`; the same data
+is available as JSON from `getactiverules`, `getaccountrules`, and
+`getrulesinforce` (see [rules_in_force.md](rules_in_force.md)).
+
 ### Compute an update-id
 
 ```bash

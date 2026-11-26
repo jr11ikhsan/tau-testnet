@@ -1044,6 +1044,183 @@ def _derive_survival_ledger(rows: List[Dict],
     return ledger
 
 
+# --- fee_rules: the o8 attribution view ------------------------------------
+#
+# #183 in one sentence: the engine works out o8 (the custom-fee stream,
+# tau_defs.CUSTOM_FEE_STREAM_INDEX) from the WHOLE specification for every
+# transaction, so a unit that never names an account can still change what
+# that account pays. The survival ledger above already knows, per unit,
+# which transaction installed it and which later transaction displaced
+# it; fee_rules is the read-only projection of that ledger onto o8 --
+# every accepted unit that writes o8, whoever sent it, in the order the
+# units joined, with the survival of the fee fragments themselves.
+#
+# The sender is resolved from this node's stored blocks (the installing
+# transaction is signed, so any stored copy names the same sender; the
+# canonical location is tried first). A unit whose transaction this node
+# has no block for -- a genesis unit, or one from before the node began
+# recording -- reads `sent_by: null` with `sent_by_status: "not_recorded"`,
+# never a guess. The record is node-local, like the ledger itself: a
+# node that never applied the block cannot attribute the unit.
+#
+# A displaced row stays listed: it no longer changes what anyone pays,
+# and the row says so. That is the advantage over a bare accumulation
+# listing, which cannot tell a live fee rule from a displaced one.
+
+
+def _sender_of_rule_tx(tx_hash: str, block_number: int) -> Optional[str]:
+    """The sender_pubkey of the transaction `tx_hash`, or None.
+
+    Read from this node's stored blocks via tx_index + the block's own
+    transaction list (the read path gettxstatus uses for retractable
+    detail). The sender is a property of the signed transaction, so a
+    fork copy would name the same sender; the canonical location is
+    still tried first. None means the node has no stored block for the
+    transaction -- genesis / pre-recording / never applied -- never a
+    guess, and never an error.
+    """
+    import db
+
+    try:
+        locations = db.get_tx_block_locations(tx_hash)
+    except Exception:
+        return None
+
+    def _canonical(loc) -> bool:
+        try:
+            return bool(db.get_canonical_confirmation(
+                loc["block_hash"], loc["block_number"])[0])
+        except Exception:
+            return False
+
+    ordered = sorted(
+        locations,
+        key=lambda loc: (
+            not _canonical(loc),
+            loc["block_number"] != block_number,
+            loc["block_number"],
+        ),
+    )
+    for loc in ordered:
+        try:
+            block = db.get_block_by_hash(loc["block_hash"]) or {}
+        except Exception:
+            continue
+        txs = block.get("transactions") or []
+        ids = block.get("tx_ids") or []
+        tx = None
+        if tx_hash in ids and len(ids) == len(txs):
+            tx = txs[ids.index(tx_hash)]
+        else:
+            for candidate in txs:
+                if isinstance(candidate, dict) \
+                        and candidate.get("tx_hash") == tx_hash:
+                    tx = candidate
+                    break
+        if isinstance(tx, dict):
+            sender = tx.get("sender_pubkey")
+            if isinstance(sender, str) and sender:
+                return sender.lower()
+    return None
+
+
+def fee_rules_for(account: str = "", target: Optional[Dict] = None) -> List[Dict]:
+    """Every accepted unit that writes the fee stream o8, whoever sent it.
+
+    One row per ACCEPTED rule outcome in the survival ledger whose
+    installed fragments write o8 (checked with admission's
+    `_streams_referenced`, the same helper the admission screen uses),
+    in apply order -- the order the units joined the accumulation.
+    Each row carries:
+
+    * `unit` -- the unit's o8-writing installed fragments, joined in
+      spec order, and `sha256` over exactly that text;
+    * `fragments` -- those fragments, individually;
+    * `names_this_account` -- whether the unit's text names `account`
+      (`#x<account>`); False when no account was named;
+    * `sent_by` -- the sender of the installing transaction, from this
+      node's stored blocks, or None (`sent_by_status: "not_recorded"`)
+      when the node has no block for it;
+    * `since` -- the block number and transaction hash that first
+      brought the unit in;
+    * `status` (`in_force` / `partially_displaced` / `displaced`) and
+      `displaced_by` (the displacing transaction hashes) -- the survival
+      of the FEE fragments themselves at `target`, so a unit whose
+      non-fee fragment was displaced but whose fee fragment survives
+      still reads `in_force`;
+    * `tx_hash`, `block_number`, `spec_revision_before/after` -- the
+      ledger unit's own coordinates, so the row joins back to it.
+
+    `target` is a snapshot-shape dict (see `_view_shape`); None means
+    the latest snapshot. Read-only: the ledger and the blocks are read,
+    never written; no state-hash change, no new consensus behaviour.
+    """
+    import db
+
+    from consensus.admission import _streams_referenced
+    import tau_defs
+
+    fee_stream = "o%d" % tau_defs.CUSTOM_FEE_STREAM_INDEX
+    if target is None:
+        target = _view_shape(db.get_latest_spec_snapshot())
+    target_frags = set()
+    if target is not None and target.get("spec_text"):
+        target_frags = set(spec_fragments(target["spec_text"]))
+
+    acct = ""
+    if account:
+        try:
+            acct = normalize_account(account)
+        except Exception:
+            acct = ""
+    needle = ("#x" + acct) if acct else None
+
+    rows: List[Dict] = []
+    for unit in survival_ledger(target):
+        o8_frags = [
+            frag for frag in unit["installed_fragments"]
+            if _streams_referenced(frag, (fee_stream,))
+        ]
+        if not o8_frags:
+            continue
+        surviving = [f for f in o8_frags if f in target_frags]
+        displaced = [f for f in o8_frags if f not in target_frags]
+        if not displaced:
+            status = "in_force"
+        elif not surviving:
+            status = "displaced"
+        else:
+            status = "partially_displaced"
+        killers: List[str] = []
+        for lost in unit["displaced_fragments"]:
+            if lost["fragment"] in displaced:
+                for killer in lost.get("displaced_by") or []:
+                    if killer not in killers:
+                        killers.append(killer)
+        unit_text = " && ".join(o8_frags)
+        sender = _sender_of_rule_tx(unit["tx_hash"], unit["block_number"])
+        rows.append({
+            "tx_hash": unit["tx_hash"],
+            "block_number": unit["block_number"],
+            "spec_revision_before": unit["spec_revision_before"],
+            "spec_revision_after": unit["spec_revision_after"],
+            "unit": unit_text,
+            "sha256": spec_hash_of(unit_text),
+            "fragments": list(o8_frags),
+            "names_this_account": bool(
+                needle and needle in unit_text.lower()),
+            "sent_by": sender,
+            "sent_by_status": "recorded" if sender else "not_recorded",
+            "since": {
+                "block_number": unit["block_number"],
+                "tx_hash": unit["tx_hash"],
+            },
+            "status": status,
+            "displaced_by": killers,
+        })
+    return rows
+
+
 def attribute_rules(spec_text: str, account: str) -> Tuple[List[str], List[str]]:
     """Split the effective spec for one account.
 

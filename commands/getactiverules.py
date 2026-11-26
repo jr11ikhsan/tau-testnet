@@ -40,7 +40,190 @@ transaction that landed on that revision (from the recorded rule
 outcomes), and the conjunct that replaced it. The ledger is derived as
 of the snapshot being served: asked at a past height, it reports the
 survival known at that height, never from later state.
+
+The response also carries `fee_rules` (see
+`consensus.active_rules.fee_rules_for`): every accepted unit that
+writes the fee stream o8, whoever sent it, in the order the units
+joined -- because o8 is worked out from the whole specification for
+every transaction, a unit that never names an account can still change
+what that account pays (#183). Each row carries the unit's o8
+fragments, their sha256, whether they name the queried account, who
+sent the installing transaction (`sent_by`, null when this node has no
+block for it), the block + transaction that first brought it in, and
+the fee fragments' own survival (`status` + `displaced_by`): a
+displaced fee rule stays listed, and the row says it no longer applies.
 """
+
+_CMD = "getactiverules"
+_USAGE = "Usage: getactiverules [account] [height]"
+
+
+def parse_args(parts):
+    """(account, height) from the tokens after the command word.
+
+    Raises ValueError with the usage message on misuse. Shared with
+    `getrulesinforce`, which takes the same arguments.
+    """
+    account = None
+    height = None
+    for token in parts[1:]:
+        if token.isdigit():
+            if height is not None:
+                raise ValueError("height given twice")
+            height = int(token)
+        elif _is_account_token(token):
+            if account is not None:
+                raise ValueError("account given twice")
+            account = _normalize_account(token)
+        else:
+            raise ValueError(
+                "arguments must be an account (96 hex characters) "
+                "and/or a height"
+            )
+    return account, height
+
+
+def view_data(database, account, height):
+    """The response data for `getactiverules [account] [height]`.
+
+    The data dict without the response envelope, shared with
+    `getaccountrules` and `getrulesinforce` so the three commands cannot
+    drift apart. Raises RuntimeError on an internal failure (the caller
+    turns it into an INTERNAL_ERROR response); an unavailable view --
+    no snapshot, or a TAMPERED journal cut -- is data
+    (`available: False`), never an error.
+    """
+    db = database
+    try:
+        if height is not None:
+            snapshot = db.get_spec_snapshot_at_height(height)
+        else:
+            snapshot = db.get_latest_spec_snapshot()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve spec snapshot: {exc}")
+
+    if snapshot is None:
+        # Explicit, per the design: snapshots exist only from the change
+        # forward, and a height before the first one has no honest answer.
+        data = {"available": False}
+        if height is not None:
+            data["requested_height"] = height
+        data["message"] = (
+            "no spec snapshot at or before the requested height"
+            if height is not None
+            else "no spec snapshot recorded yet"
+        )
+        return data
+
+    # Step 7 stopgap (B02 §2): serve the journal cut's text + sha256
+    # when the stored snapshot diverges from the replayed journal at
+    # the snapshot's own height. The snapshot is the fast path and is
+    # served unchanged when it agrees; the check only replaces a
+    # divergent snapshot. When NO snapshot exists the answer stays
+    # not-available (the wipe contract: a wiped node answers
+    # available:false) -- the cut is never substituted for a missing
+    # snapshot here. The unit ledger below is derived from the CHECKED
+    # snapshot sequence (O-4 (a)): the ledger describes the served
+    # state, so each snapshot is mapped through the Step 7 check
+    # before the ledger reads it -- the stored text and the served
+    # text diverge on builtin 02 (the worker's fed form is shrunk to
+    # bv[8]; the journal cut renders full-width bv[384]), so a ledger
+    # read from the stored text attributes units to a state the view
+    # does not serve. The permanent fix unifies the two
+    # canonicalizations; until then the ledger reads the checked text
+    # by construction, and the stored-vs-cut divergence is visible
+    # only through the derived="journal_cut" marker.
+    view = active_rules.checked_snapshot_answer(snapshot)
+    if view is None:
+        # O-2: the served snapshot's own journal-cut check held (its
+        # cut is TAMPERED) -- hold, do not serve the snapshot. Fail
+        # closed for integrity, with the code carried so the caller
+        # can say why the view is unavailable.
+        data = {"available": False}
+        if height is not None:
+            data["requested_height"] = height
+        data["message"] = (
+            "the journal cut for the served snapshot is TAMPERED; "
+            "the active rules are not available")
+        data["cut_status"] = active_rules.CUT_TAMPERED
+        return data
+    data = {
+        "available": True,
+        "spec_revision": view["spec_revision"],
+        "height": view["height"],
+        "canonical_text": view["spec_text"],
+        "sha256": view["spec_hash"],
+    }
+    if view.get("derived") is not None:
+        data["derived"] = view["derived"]
+    try:
+        sequence, sequence_code = active_rules.checked_snapshot_sequence(
+            db.get_all_spec_snapshots(
+                upto_revision=snapshot["spec_revision"]))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to check the snapshot sequence: {exc}")
+    if sequence is None:
+        # O-2: a snapshot in the served history fails its journal-cut
+        # check (TAMPERED) -- hold, do not serve a ledger over a
+        # history whose integrity is broken. (Defense in depth: the
+        # journal is append-only, so a tampered entry in an earlier
+        # cut is in every later cut too -- the served snapshot's own
+        # check would hold first; this branch catches the same failure
+        # if the sequence is ever checked on its own.)
+        data = {"available": False}
+        if height is not None:
+            data["requested_height"] = height
+        data["message"] = (
+            "the journal cut for a snapshot in the served history is "
+            "TAMPERED; the active rules are not available")
+        data["cut_status"] = sequence_code
+        return data
+    try:
+        data["units"] = derive_unit_ledger(
+            sequence, db.get_rule_tx_by_revision()
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to derive unit ledger: {exc}")
+    try:
+        # fee_rules is derived at the served snapshot, so asked at a
+        # past height it reports the fee rules known at that height --
+        # not the current tip's (contrast the #180 view, which serves
+        # the current-tip accumulation even at a historical block).
+        data["fee_rules"] = active_rules.fee_rules_for(
+            account or "", target=view)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to derive fee rules: {exc}")
+    if height is not None:
+        data["requested_height"] = height
+    if account is not None:
+        rules, unattributed = split_conjuncts_by_account(
+            view["spec_text"], account
+        )
+        data["account"] = account
+        data["rules"] = rules
+        data["unattributed"] = unattributed
+    return data
+
+
+def execute(raw_command: str, container):
+    parts = raw_command.split()
+    if not 1 <= len(parts) <= 3:
+        return api_response.error_response(
+            _CMD, _USAGE, "INVALID_PARAMS",
+        )
+    try:
+        account, height = parse_args(parts)
+    except ValueError as exc:
+        return api_response.error_response(
+            _CMD, str(exc), "INVALID_PARAMS",
+        )
+    try:
+        data = view_data(container.db, account, height)
+    except RuntimeError as exc:
+        return api_response.error_response(
+            _CMD, str(exc), "INTERNAL_ERROR",
+        )
+    return api_response.success_response(_CMD, data)
 import re
 
 import api_response
@@ -266,146 +449,3 @@ def derive_unit_ledger(snapshots, tx_by_revision):
         elif unit["displaced_conjuncts"]:
             unit["status"] = "partially_displaced"
     return units
-
-
-def execute(raw_command: str, container):
-    parts = raw_command.split()
-    if not 1 <= len(parts) <= 3:
-        return api_response.error_response(
-            "getactiverules",
-            "Usage: getactiverules [account] [height]",
-            "INVALID_PARAMS",
-        )
-    account = None
-    height = None
-    for token in parts[1:]:
-        if token.isdigit():
-            if height is not None:
-                return api_response.error_response(
-                    "getactiverules", "height given twice", "INVALID_PARAMS"
-                )
-            height = int(token)
-        elif _is_account_token(token):
-            if account is not None:
-                return api_response.error_response(
-                    "getactiverules", "account given twice", "INVALID_PARAMS"
-                )
-            account = _normalize_account(token)
-        else:
-            return api_response.error_response(
-                "getactiverules",
-                "arguments must be an account (96 hex characters) and/or a height",
-                "INVALID_PARAMS",
-            )
-
-    db = container.db
-    try:
-        if height is not None:
-            snapshot = db.get_spec_snapshot_at_height(height)
-        else:
-            snapshot = db.get_latest_spec_snapshot()
-    except Exception as exc:
-        return api_response.error_response(
-            "getactiverules", f"Failed to resolve spec snapshot: {exc}",
-            "INTERNAL_ERROR",
-        )
-
-    if snapshot is None:
-        # Explicit, per the design: snapshots exist only from the change
-        # forward, and a height before the first one has no honest answer.
-        data = {"available": False}
-        if height is not None:
-            data["requested_height"] = height
-        data["message"] = (
-            "no spec snapshot at or before the requested height"
-            if height is not None
-            else "no spec snapshot recorded yet"
-        )
-        return api_response.success_response("getactiverules", data)
-
-    # Step 7 stopgap (B02 §2): serve the journal cut's text + sha256
-    # when the stored snapshot diverges from the replayed journal at
-    # the snapshot's own height. The snapshot is the fast path and is
-    # served unchanged when it agrees; the check only replaces a
-    # divergent snapshot. When NO snapshot exists the answer stays
-    # not-available (the wipe contract: a wiped node answers
-    # available:false) -- the cut is never substituted for a missing
-    # snapshot here. The unit ledger below is derived from the CHECKED
-    # snapshot sequence (O-4 (a)): the ledger describes the served
-    # state, so each snapshot is mapped through the Step 7 check
-    # before the ledger reads it -- the stored text and the served
-    # text diverge on builtin 02 (the worker's fed form is shrunk to
-    # bv[8]; the journal cut renders full-width bv[384]), so a ledger
-    # read from the stored text attributes units to a state the view
-    # does not serve. The permanent fix unifies the two
-    # canonicalizations; until then the ledger reads the checked text
-    # by construction, and the stored-vs-cut divergence is visible
-    # only through the derived="journal_cut" marker.
-    view = active_rules.checked_snapshot_answer(snapshot)
-    if view is None:
-        # O-2: the served snapshot's own journal-cut check held (its
-        # cut is TAMPERED) -- hold, do not serve the snapshot. Fail
-        # closed for integrity, with the code carried so the caller
-        # can say why the view is unavailable.
-        data = {"available": False}
-        if height is not None:
-            data["requested_height"] = height
-        data["message"] = (
-            "the journal cut for the served snapshot is TAMPERED; "
-            "the active rules are not available")
-        data["cut_status"] = active_rules.CUT_TAMPERED
-        return api_response.success_response("getactiverules", data)
-    data = {
-        "available": True,
-        "spec_revision": view["spec_revision"],
-        "height": view["height"],
-        "canonical_text": view["spec_text"],
-        "sha256": view["spec_hash"],
-    }
-    if view.get("derived") is not None:
-        data["derived"] = view["derived"]
-    try:
-        sequence, sequence_code = active_rules.checked_snapshot_sequence(
-            db.get_all_spec_snapshots(
-                upto_revision=snapshot["spec_revision"]))
-    except Exception as exc:
-        return api_response.error_response(
-            "getactiverules",
-            f"Failed to check the snapshot sequence: {exc}",
-            "INTERNAL_ERROR",
-        )
-    if sequence is None:
-        # O-2: a snapshot in the served history fails its journal-cut
-        # check (TAMPERED) -- hold, do not serve a ledger over a
-        # history whose integrity is broken. (Defense in depth: the
-        # journal is append-only, so a tampered entry in an earlier
-        # cut is in every later cut too -- the served snapshot's own
-        # check would hold first; this branch catches the same failure
-        # if the sequence is ever checked on its own.)
-        data = {"available": False}
-        if height is not None:
-            data["requested_height"] = height
-        data["message"] = (
-            "the journal cut for a snapshot in the served history is "
-            "TAMPERED; the active rules are not available")
-        data["cut_status"] = sequence_code
-        return api_response.success_response("getactiverules", data)
-    try:
-        data["units"] = derive_unit_ledger(
-            sequence, db.get_rule_tx_by_revision()
-        )
-    except Exception as exc:
-        return api_response.error_response(
-            "getactiverules", f"Failed to derive unit ledger: {exc}",
-            "INTERNAL_ERROR",
-        )
-    if height is not None:
-        data["requested_height"] = height
-    if account is not None:
-        rules, unattributed = split_conjuncts_by_account(
-            view["spec_text"], account
-        )
-        data["account"] = account
-        data["rules"] = rules
-        data["unattributed"] = unattributed
-    return api_response.success_response("getactiverules", data)
