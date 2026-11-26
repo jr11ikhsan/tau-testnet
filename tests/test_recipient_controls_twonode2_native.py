@@ -526,6 +526,32 @@ def _assert_child_ok(proc, record, role):
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
 
 
+def _ingest_detail(proc_p, prop, proc_f, foll):
+    """Failure context for an ingest mismatch: both children's captured
+    logs (the [BLOCKCHAIN] rejection reason lives there — the child
+    processes log it to stderr) plus both ingest/verdict records."""
+    def tail(text, n=4000):
+        return (text or "")[-n:]
+
+    def heads(record):
+        return {label: (cp.get("height"), (cp.get("head_hash") or "")[:16],
+                         (cp.get("state_hash") or "")[:16],
+                         cp.get("balances"), cp.get("escrow"))
+                for label, cp in (record.get("checkpoints") or {}).items()}
+    return (
+        "\n--- proposer ingest: " + json.dumps(prop.get("ingest"), sort_keys=True)
+        + "\n--- follower ingest: " + json.dumps(foll.get("ingest"), sort_keys=True)
+        + "\n--- proposer verdicts: " + json.dumps(prop.get("verdicts"), sort_keys=True)
+        + "\n--- follower verdicts: " + json.dumps(foll.get("verdicts"), sort_keys=True)
+        + "\n--- proposer heads: " + json.dumps(heads(prop), sort_keys=True, default=str)
+        + "\n--- follower heads: " + json.dumps(heads(foll), sort_keys=True, default=str)
+        + "\n--- proposer stderr tail:\n" + tail(proc_p.stderr)
+        + "\n--- follower stderr tail:\n" + tail(proc_f.stderr)
+        + "\n--- proposer stdout tail:\n" + tail(proc_p.stdout)
+        + "\n--- follower stdout tail:\n" + tail(proc_f.stdout)
+    )
+
+
 def test_recipient_controls_two_node_two_recipients_and_restart(tmp_path):
     """Two nodes, two recipients, one restart: the recipient gate's
     verdicts are identical on proposer and follower at every checkpoint,
@@ -540,9 +566,11 @@ def test_recipient_controls_two_node_two_recipients_and_restart(tmp_path):
     assert rest["restart"] is True
 
     for label, ok in sorted(foll["ingest"].items()):
-        assert ok, f"follower failed to ingest {label}"
+        assert ok, (f"follower failed to ingest {label}"
+                    + _ingest_detail(proc_p, prop, proc_f, foll))
     for label, ok in sorted(prop["ingest"].items()):
-        assert ok, f"proposer failed to ingest {label}"
+        assert ok, (f"proposer failed to ingest {label}"
+                    + _ingest_detail(proc_p, prop, proc_f, foll))
     for label, produced in sorted(prop["produced"].items()):
         assert produced["n_tx"] == 1, f"proposer's {label} block: {produced}"
 
