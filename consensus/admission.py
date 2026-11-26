@@ -320,6 +320,324 @@ def _open_governance_admission() -> bool:
     return bool(getattr(config.settings.authority, "open_governance_admission", False))
 
 
+class _O8ParseError(Exception):
+    """Rule text outside the fragment the o8 scope screen can reason about."""
+
+
+class _O8Parser:
+    """Recursive-descent parser for the user-fee-rule formula fragment.
+
+    Tokens come from the repo tokenizer (``tau_shrink._tokenize``), comments
+    stripped first. Grammar:
+
+        rule    := ("always" | "sometimes")? formula "."?
+        formula := ternary
+        ternary := imp ("?" ternary ":" ternary)?
+        imp     := or (("->" | "<-" | "<->") imp)?      (right-associative)
+        or      := and (("||" | "^^") and)*
+        and     := cmp ("&&" cmp)*
+        cmp     := arith (("=" | "!=" | "<" | "<=" | ">" | ">=") arith)?
+        arith   := factor (("+" | "-" | "*" | "/" | "%" | "<<" | ">>"
+                           | "&" | "|" | "^") factor)*
+        factor  := ("!" | "-") factor | atom ("'")*
+        atom    := streamref | bvlit | hexnum | num | ("true" | "false")
+                 | "(" formula ")"
+
+    AST nodes are tuples: ("and"|"or"|"imp"|"revimp"|"iff", l, r),
+    ("tern", cond, then, els), ("not", x), ("cmp", op, l, r),
+    ("bin", op, l, r), ("un", op, x), ("atom", tok). "^^" (xor) is treated
+    like "||" for guard purposes: in ``A ^^ B`` neither side's guard covers
+    the other, because each side holds exactly when the other is false.
+    """
+
+    _CMP_OPS = frozenset({"=", "!=", "<", "<=", ">", ">="})
+    _ARITH_OPS = frozenset({"+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^"})
+    _IMP_KINDS = {"->": "imp", "<-": "revimp", "<->": "iff"}
+
+    def __init__(self, tokens):
+        self.toks = tokens
+        self.pos = 0
+
+    def _peek(self):
+        return self.toks[self.pos] if self.pos < len(self.toks) else None
+
+    def _eat_op(self, text):
+        tok = self._peek()
+        if tok is not None and tok.kind == "op" and tok.text == text:
+            self.pos += 1
+            return True
+        return False
+
+    def _eat_text(self, text):
+        # "?" tokenizes as kind "other"; ":" as kind "colon".
+        tok = self._peek()
+        if tok is not None and tok.text == text:
+            self.pos += 1
+            return True
+        return False
+
+    def parse_rule(self):
+        tok = self._peek()
+        if tok is not None and tok.kind == "ident" and tok.text in ("always", "sometimes"):
+            self.pos += 1
+        node = self._formula()
+        self._eat_kind("dot")  # optional trailing "."
+        if self.pos != len(self.toks):
+            raise _O8ParseError("trailing tokens after rule")
+        return node
+
+    def _eat_kind(self, kind):
+        tok = self._peek()
+        if tok is not None and tok.kind == kind:
+            self.pos += 1
+            return True
+        return False
+
+    def _formula(self):
+        return self._ternary()
+
+    def _ternary(self):
+        node = self._imp()
+        if self._eat_text("?"):
+            then = self._ternary()
+            if not self._eat_text(":"):
+                raise _O8ParseError("ternary without ':'")
+            els = self._ternary()
+            node = ("tern", node, then, els)
+        return node
+
+    def _imp(self):
+        node = self._or()
+        tok = self._peek()
+        if tok is not None and tok.kind == "op" and tok.text in self._IMP_KINDS:
+            self.pos += 1
+            rhs = self._imp()
+            node = (self._IMP_KINDS[tok.text], node, rhs)
+        return node
+
+    def _or(self):
+        node = self._and()
+        while True:
+            tok = self._peek()
+            if tok is not None and tok.kind == "op" and tok.text in ("||", "^^"):
+                self.pos += 1
+                node = ("or", node, self._and())
+            else:
+                return node
+
+    def _and(self):
+        node = self._cmp()
+        while self._eat_op("&&"):
+            node = ("and", node, self._cmp())
+        return node
+
+    def _cmp(self):
+        node = self._arith()
+        tok = self._peek()
+        if tok is not None and tok.kind == "op" and tok.text in self._CMP_OPS:
+            self.pos += 1
+            node = ("cmp", tok.text, node, self._arith())
+        return node
+
+    def _arith(self):
+        node = self._factor()
+        while True:
+            tok = self._peek()
+            if tok is not None and tok.kind == "op" and tok.text in self._ARITH_OPS:
+                self.pos += 1
+                node = ("bin", tok.text, node, self._factor())
+            else:
+                return node
+
+    def _factor(self):
+        tok = self._peek()
+        if tok is not None and tok.kind == "op" and tok.text in ("!", "-"):
+            self.pos += 1
+            inner = self._factor()
+            return ("not", inner) if tok.text == "!" else ("un", "-", inner)
+        node = self._atom()
+        while self._eat_op("'"):
+            node = ("un", "'", node)
+        return node
+
+    def _atom(self):
+        tok = self._peek()
+        if tok is None:
+            raise _O8ParseError("unexpected end of rule")
+        if tok.kind == "group" and tok.text == "(":
+            self.pos += 1
+            node = self._formula()
+            nxt = self._peek()
+            if nxt is None or nxt.kind != "group" or nxt.text != ")":
+                raise _O8ParseError("unbalanced '('")
+            self.pos += 1
+            return node
+        if tok.kind in ("streamref", "bvlit", "hexnum", "num"):
+            self.pos += 1
+            return ("atom", tok)
+        if tok.kind == "ident" and tok.text in ("true", "false"):
+            self.pos += 1
+            return ("atom", tok)
+        raise _O8ParseError(f"unexpected token {tok.kind} {tok.text!r}")
+
+
+def _o8_children(node):
+    kind = node[0]
+    if kind in ("and", "or", "imp", "revimp", "iff"):
+        return (node[1], node[2])
+    if kind in ("cmp", "bin"):
+        return (node[2], node[3])
+    if kind == "tern":
+        return (node[1], node[2], node[3])
+    if kind == "not":
+        return (node[1],)
+    if kind == "un":
+        return (node[2],)
+    return ()
+
+
+def _o8_ref_of(node, shrink):
+    if node[0] != "atom":
+        return None
+    tok = node[1]
+    if tok.kind != "streamref":
+        return None
+    return shrink._ref_of(tok, -1)
+
+
+def _o8_is_identity_ref(node, shrink):
+    ref = _o8_ref_of(node, shrink)
+    return (
+        ref is not None
+        and ref.io == "i"
+        and ref.index in (12, 3)
+        and ref.time_expr == "t"
+    )
+
+
+def _o8_is_o8_ref(node, shrink):
+    ref = _o8_ref_of(node, shrink)
+    return ref is not None and ref.io == "o" and ref.index == 8
+
+
+def _o8_lit_of(node, shrink):
+    if node[0] != "atom":
+        return None
+    tok = node[1]
+    if tok.kind != "bvlit":
+        return None
+    return shrink._lit_of(tok)
+
+
+def _o8_is_identity_guard(node, shrink):
+    """A literal identity equality: i12[t]/i3[t] = <bitvector literal>."""
+    if node[0] != "cmp" or node[1] != "=":
+        return False
+    left, right = node[2], node[3]
+    return (
+        _o8_is_identity_ref(left, shrink) and _o8_lit_of(right, shrink) is not None
+    ) or (
+        _o8_is_identity_ref(right, shrink) and _o8_lit_of(left, shrink) is not None
+    )
+
+
+def _o8_is_zero_write(node, shrink):
+    """An equality assigning a literal zero to o8: it charges nobody."""
+    if node[0] != "cmp" or node[1] != "=":
+        return False
+    left, right = node[2], node[3]
+    for stream_side, other_side in ((left, right), (right, left)):
+        if _o8_is_o8_ref(stream_side, shrink):
+            lit = _o8_lit_of(other_side, shrink)
+            if lit is not None and lit["is_zero"]:
+                return True
+    return False
+
+
+def _o8_mentions(node, shrink):
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if cur[0] == "atom":
+            if _o8_is_o8_ref(cur, shrink):
+                return True
+        else:
+            stack.extend(_o8_children(cur))
+    return False
+
+
+def _o8_top_guard(node, shrink):
+    """True when the node itself asserts an identity guard unconditionally:
+    the guard itself, or a conjunction/equivalence one of whose top-level
+    conjuncts is one. A guard inside an ||, ->, ?: or ! does NOT qualify —
+    it does not hold on every path through the node."""
+    if _o8_is_identity_guard(node, shrink):
+        return True
+    if node[0] in ("and", "iff"):
+        return _o8_top_guard(node[1], shrink) or _o8_top_guard(node[2], shrink)
+    return False
+
+
+def _o8_safe(node, guard, shrink):
+    """True when every charged o8 write in `node` is covered by `guard` or by
+    a guard conjoined with it on the same path. `guard` is the identity guard
+    already established by enclosing connectives."""
+    kind = node[0]
+    if kind in ("and", "iff"):
+        g2 = guard or _o8_top_guard(node[1], shrink) or _o8_top_guard(node[2], shrink)
+        return _o8_safe(node[1], g2, shrink) and _o8_safe(node[2], g2, shrink)
+    if kind == "or":
+        return _o8_safe(node[1], guard, shrink) and _o8_safe(node[2], guard, shrink)
+    if kind == "imp":
+        return _o8_safe(node[1], guard, shrink) and _o8_safe(
+            node[2], guard or _o8_top_guard(node[1], shrink), shrink
+        )
+    if kind == "revimp":
+        return _o8_safe(node[2], guard, shrink) and _o8_safe(
+            node[1], guard or _o8_top_guard(node[2], shrink), shrink
+        )
+    if kind == "tern":
+        return (
+            _o8_safe(node[1], guard, shrink)
+            and _o8_safe(node[2], guard or _o8_top_guard(node[1], shrink), shrink)
+            and _o8_safe(node[3], guard, shrink)
+        )
+    if kind == "not":
+        return _o8_safe(node[1], guard, shrink)
+    if _o8_is_zero_write(node, shrink):
+        return True
+    if _o8_mentions(node, shrink):
+        return guard
+    return True
+
+
+def screen_o8_sender_scope(rule_text: str) -> bool:
+    """Structural (AST) proof that every charged write to the shared fee
+    stream o8 in `rule_text` is scoped to its author's identity — G2 (B01).
+
+    Returns True iff, for every comparison (or other formula) mentioning o8
+    that charges a nonzero fee, a literal identity guard (``i12[t]`` /
+    ``i3[t]`` = bitvector literal, either orientation) is conjoined with the
+    write on the same path: as an ``&&``/``<->`` conjunct, as an implication
+    antecedent, or as a ternary condition covering the then-branch. A write
+    of a literal zero charges nobody and needs no guard. Anything the parser
+    cannot account for fails closed (returns False): unparsable text, unknown
+    tokens, bare stream idents, quantified or out-of-fragment forms.
+
+    This proves the ORIGIN of each o8 write. It does not bound the AMOUNT —
+    that is FIX 8's shared cap (payout execute), which stays in force
+    alongside this screen; the two are complementary, not duplicates.
+    """
+    import tau_shrink
+
+    try:
+        tokens = tau_shrink._tokenize(_strip_tau_comments(rule_text))
+        node = _O8Parser(tokens).parse_rule()
+    except Exception:
+        return False
+    return _o8_safe(node, False, tau_shrink)
+
+
 class UserRuleRejection(NamedTuple):
     error: str
     reason: str
@@ -382,14 +700,20 @@ def screen_user_rule_text(
         )
 
     # o8 is shared across senders, so an unscoped write taxes fees for all.
-    # A reference is not proof of gating; this catches the accidental global rule only.
+    # Structural (AST) scope proof, not a textual mention: every charged o8
+    # write must be conjoined with a literal identity guard (i12/i3 = literal)
+    # on the same path — screen_o8_sender_scope (G2). A reference that does
+    # not gate the write (tautology, dead branch, free side only) is no scope.
+    # This proves the ORIGIN of each write; the shared cap (FIX 8) bounds the
+    # TOTAL — complementary, not a duplicate.
     policy_out = _streams_referenced(rule_text, ("o8",))
-    if policy_out and not _streams_referenced(rule_text, ("i12", "i3")):
+    if policy_out and not screen_o8_sender_scope(rule_text):
         return UserRuleRejection(
             f"user_tx rule text writes shared policy stream '{policy_out[0]}' "
             f"without a sender scope: it would apply to every account on the "
-            f"network. Guard the rule on your own identity — reference i12 "
-            f"(sender pubkey) or i3 (from address), e.g. "
+            f"network. Guard every charged {policy_out[0]} write on your own identity — "
+            f"a literal i12 (sender pubkey) or i3 (from address) equality "
+            f"conjoined with the write, e.g. "
             f"always ((i12[t]:bv[384] = {{ #x<your pubkey> }}:bv[384]) -> "
             f"{policy_out[0]}[t]:bv[24] = {{ #x000000 }}:bv[24]).",
             "unscoped_user_rule",

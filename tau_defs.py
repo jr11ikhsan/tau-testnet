@@ -93,16 +93,24 @@ TAU_OUTPUT_STREAM_RULES = "o0"
 TAU_OUTPUT_STREAM_VALIDATION_RESULT = "o1"
 
 # --- User Policy Stream ---
-# o5 is the shared user-policy output stream.
-# Multiple users can write sender-scoped rules to o5; Tau composes them
-# into a single logical constraint. Each user rule MUST be guarded by
-# that user's sender identity (i12 sender pubkey, or i3 from-address) to
-# avoid affecting other users. This is ENFORCED at mempool admission and at
-# block apply for both o5 and o8: rule text writing either without referencing
-# i12 or i3 is rejected with UNSCOPED_USER_RULE (consensus/admission.py),
-# because a single unscoped `always (o5[t] = 0)` would block every account on
-# the network. The screen is textual — it cannot prove the scope actually
-# gates the assignment. Rules may also read i4 (recipient) and i5
+# o5 is the per-account user-policy output stream: a user o5 rule is
+# registered as that account's own clause and judges only that account's
+# transfers (it never joins the shared specification), so it takes no sender
+# guard at all — a reference to i12 in one is refused, CLAUSE_SHAPE.
+# o8 is the shared user-fee output stream: o8 rules accumulate in one shared
+# specification, so every CHARGED write to o8 must be guarded by the author's
+# sender identity (i12 sender pubkey, or i3 from-address) to avoid taxing
+# other users. This is ENFORCED at mempool admission and at block apply:
+# rule text writing o8 without a literal identity guard conjoined with every
+# charged write is rejected with UNSCOPED_USER_RULE (consensus/admission.py
+# screen_o8_sender_scope, G2). The screen is STRUCTURAL (AST over the repo
+# tokenizer, fail-closed): it proves the guard actually gates the write — a
+# mere mention of i12, a tautology, or a guard that only covers the zero-fee
+# branch does not count. A write of a literal zero charges nobody and needs
+# no guard. The screen proves the ORIGIN of each o8 write; the shared cap
+# (FIX 8) bounds the TOTAL — complementary, not duplicates.
+#
+# Rules may also read i4 (recipient) and i5
 # (block timestamp) — both real at admission and apply — for recipient
 # whitelists and time-locks.
 #

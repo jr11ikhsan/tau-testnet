@@ -140,12 +140,15 @@ def _history_policy(pk, previous="000007"):
     `previous`, so its transfer with that fee limit is refused.
 
     Total form on every branch: an unconstrained o8 materializes as 0 for every
-    other sender on the network.
+    other sender on the network. The else branches therefore write a literal
+    zero — a nonzero else would tax every sender except the author and the
+    structural o8 sender-scope screen (G2, consensus/admission.py) rightly
+    refuses it.
     """
     return ("always ( (i12[t]:bv[384] = { #x%s }:bv[384]) ? "
             "((i1[t-1]:bv[24] = { #x%s }:bv[24]) ? (o8[t]:bv[24] = { #x001388 }:bv[24]) "
-            ": (o8[t]:bv[24] = { #x000001 }:bv[24])) "
-            ": (o8[t]:bv[24] = { #x000001 }:bv[24]) )." % (pk, previous))
+            ": (o8[t]:bv[24] = { #x000000 }:bv[24])) "
+            ": (o8[t]:bv[24] = { #x000000 }:bv[24]) )." % (pk, previous))
 
 
 def _submit_limited(sk, pk, ops):

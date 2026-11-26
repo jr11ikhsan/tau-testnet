@@ -105,10 +105,15 @@ def _submit(sk, pk, ops, seq=0, fee_limit="100000"):
 
 
 def _scoped_rule(pk, value="000001"):
-    """Admission requires an o8 fee rule to be scoped to its sender."""
+    """Admission requires an o8 fee rule to be scoped to its sender.
+
+    The else branch writes a literal zero: it holds exactly when the sender
+    is NOT the author, so a nonzero else would tax every other sender and the
+    structural o8 sender-scope screen (G2, consensus/admission.py) refuses it.
+    """
     return (f"always ( (i12[t]:bv[384] = {{ #x{pk} }}:bv[384]) ? "
             f"(o8[t]:bv[24] = {{ #x{value} }}:bv[24]) : "
-            f"(o8[t]:bv[24] = {{ #x000001 }}:bv[24]) ).")
+            f"(o8[t]:bv[24] = {{ #x000000 }}:bv[24]) ).")
 
 
 def test_a_mined_block_commits_through_one_protocol_and_promotes_its_worker(authority):

@@ -343,9 +343,16 @@ class TestAdmissionLimits:
 
     def test_user_rule_scoping_on_i12_still_accepted_under_tau_validator_set(self):
         # Reading i12 is how a fee rule scopes itself to its own sender; the
-        # reserved-set reuse for rule TEXT must keep excluding it.
+        # reserved-set reuse for rule TEXT must keep excluding it. The rule
+        # must be GENUINELY scoped (G2): the old tautology shape
+        # `o8 = 1 || i12 != i12` only mentioned i12 and is now rightly
+        # refused as unscoped — it never proved the reserved-set point, the
+        # textual screen just let it through.
         from consensus.admission import validate_user_tx_reserved_domains
-        rule = "always ( o8[t]:bv[24] = { 1 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384] )."
+        rule = (
+            "always ((i12[t]:bv[384] = { #x" + "ab" * 48 + " }:bv[384]) -> "
+            "o8[t]:bv[24] = { #x000001 }:bv[24])."
+        )
         assert validate_user_tx_reserved_domains(
             {"operations": {"0": rule}}, self._tau_validator_set_tip_view()).is_valid
 
@@ -558,16 +565,15 @@ class TestUserRuleSenderScope:
         assert result.is_valid, result.error
 
     def test_known_gap_reference_is_not_proof_of_gating(self):
-        """Documented limitation, asserted so it is a known state rather than a
-        surprise: the screen is textual, so a rule that merely mentions i12
-        without gating on it passes. Catching this needs formula analysis."""
+        """FLIPPED (G2, B01): the screen is now structural, so a rule that merely
+        mentions i12 without gating on it is REJECTED. The old textual screen
+        passed this shape; the AST screen proves the write is unguarded."""
         result = self._screen(
             "always (o8[t]:bv[24] = { #x000003 }:bv[24] || i12[t]:bv[384] != i12[t]:bv[384])."
         )
-        assert result.is_valid, (
-            "if this now fails, the screen gained real scope analysis — good, "
-            "update the docs in tau_defs.py and README that call it textual"
-        )
+        assert not result.is_valid
+        assert result.code == "UNSCOPED_USER_RULE"
+        assert result.details["stream"] == "o8"
 
 
 class TestBalanceReadingPolicyRules:
