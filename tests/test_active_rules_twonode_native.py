@@ -29,11 +29,12 @@ rule over o28 -- one block each. Asserted on BOTH nodes, per height:
     same spec, both sides neutral, allowed.
 
 Then the follower is RESTARTED as a new process on the same database
-(chain_state.load_state_from_db, the production restart path). The
-rebuild re-records the view's snapshots from the replayed blocks (the
-record seam runs on the rebuild path too), and the restarted node must
-answer every height identically -- proving the view is a function of
-the committed record, not of any process's memory.
+(chain_state.load_state_from_db, the production restart path, followed
+by chain_state.rebuild_state_from_blockchain(0)). The rebuild
+re-records the view's snapshots from the replayed blocks (the record
+seam runs on the rebuild path too), and the restarted node must answer
+every height identically -- proving the view is a function of the
+committed record, not of any process's memory.
 
 PORT NOTE: the #134-line original read cut answers through its
 `getactiverules`; on this line the command serves snapshots only, so
@@ -204,6 +205,24 @@ def main():
     patch("consensus.engine.TauConsensusEngine.verify_block_header",
           return_value=True).start()
     patch("consensus.bls.verify", lambda *a, **k: True).start()
+
+    if RESTART:
+        # Bedah B02 §4 (Opsi A): the production restart path
+        # (load_state_from_db, above) is a fast-load that never replays
+        # blocks and never touches spec_snapshots -- so on a database
+        # whose snapshots were wiped it answers not-available at every
+        # height. The test's docstring claims the REBUILD re-records
+        # the view's snapshots from the replayed blocks; call the real
+        # rebuild here so the claim is tested literally. The rebuild
+        # replays the committed blocks through the same commit
+        # protocol as live blocks and re-records each block's
+        # spec_snapshots (chain_state._record_rule_view_data).
+        _rebuild = chain_state.rebuild_state_from_blockchain(0)
+        if not _rebuild.ok:
+            raise RuntimeError(
+                "rebuild_state_from_blockchain failed: "
+                f"{_rebuild.reason} (stopped at block "
+                f"{_rebuild.stopped_at_block})")
 
     sk = bls.KeyGen(b"b02-twonode-sender".ljust(32, b"_"))
     sender = bls.SkToPk(sk).hex()
