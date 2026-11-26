@@ -159,6 +159,15 @@ def test_recount_dedups_repeated_text():
     assert split_accumulated_units(text) == [RULE_4.strip()]
 
 
+def test_recount_counts_bare_bodies_too():
+    # The node accepts bare rule bodies (no `always` wrapper), so the
+    # recount must measure them -- otherwise they would evade the budget.
+    # A bare body has no wrapper node: `=` + two streams = 3 nodes.
+    bare = "o12[t]:bv[24] = i1[t]:bv[24]."
+    assert recount_shared_budget(bare) == (1, 3)
+    assert recount_shared_budget(RULE_4 + "\n" + bare) == (2, 4 + 3)
+
+
 def test_recount_skips_genesis_seed_and_unparseable_units():
     assert recount_shared_budget(SEED) == (0, 0)
     assert recount_shared_budget(SEED + "\n" + RULE_4) == (1, 4)
@@ -176,9 +185,22 @@ def test_check_shared_rule_budget():
     assert check_shared_rule_budget(RULE_O5, budget) is None  # never counts
     budget.charge(_info(RULE_4))
     assert "exhausted" in (check_shared_rule_budget(RULE_O8, budget) or "")
-    # A fragment-invalid text is a fragment matter, reported as such.
-    assert "unknown stream" in (
-        check_shared_rule_budget("always ( foo[t] = 0 ).", budget) or ""
+    # An unparseable text is NOT a budget matter: it is unmeasurable, the
+    # compile gate judges it, and the recount skips it -- so the budget
+    # check passes it (the fragment screen rejects always-units first
+    # with RULE_FRAGMENT; garbage never reaches here as a budget refusal).
+    assert check_shared_rule_budget("always ( foo[t] = 0 ).", budget) is None
+    assert check_shared_rule_budget("invalid rule here", budget) is None
+    # ...while a parseable bare body IS measured against the budget.
+    fresh = SharedRuleBudget(limits=SharedRuleLimits(occurrences=10))
+    assert check_shared_rule_budget(
+        "o26[t]:bv[24] = { 7 }:bv[24].", fresh
+    ) is None
+    budget2 = SharedRuleBudget(limits=SharedRuleLimits(occurrences=2))
+    budget2.charge(_info(RULE_4))
+    budget2.charge(_info(RULE_4))
+    assert "exhausted" in (
+        check_shared_rule_budget("o26[t]:bv[24] = { 7 }:bv[24].", budget2) or ""
     )
 
 

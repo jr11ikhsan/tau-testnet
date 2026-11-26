@@ -421,10 +421,28 @@ def screen_user_rule_text(
     # already refuse keeps its old reason; only a text that PASSES them and
     # violates the allow-list gets RULE_FRAGMENT (or TEMPORAL_REFERENCE for
     # a non-[t] step the parser finds first).
-    try:
-        parse_rule_fragment(rule_text)
-    except FragmentError as exc:
-        return UserRuleRejection(str(exc), "rule_fragment", exc.code)
+    #
+    # SCOPE OF THE SCREEN (hard-won, 2026-11-27): the parser judges ONLY
+    # the canonical ``always ( ... )`` form (see
+    # ``consensus.rule_fragment.is_always_unit``). Op-0 is NOT always an
+    # always-unit: the node accepts bare rule bodies
+    # (``o12[t]:bv[24] = i1[t]:bv[24].``), opaque op-0 data
+    # (``some_other_op_data``), placeholders under mocks (``rule X``), and
+    # garbage (``invalid rule here``). Those must reach the compile gate
+    # untouched -- it is the final judge and owns the pinned codes
+    # (TX_REJECTED for a bad rule, ADMISSION_TIMEOUT for a slow compile,
+    # ADMISSION_UNAVAILABLE, INTERNAL_ERROR). Screening them here
+    # relabelled every one of those as RULE_FRAGMENT and rejected live
+    # bare-body rules at apply (17 failures in the 2026-11-27 full mock
+    # run). The budget machinery measures bare bodies separately via
+    # ``parse_rule_fragment_or_body`` -- measurement, not rejection.
+    from consensus.rule_fragment import is_always_unit
+
+    if is_always_unit(rule_text):
+        try:
+            parse_rule_fragment(rule_text)
+        except FragmentError as exc:
+            return UserRuleRejection(str(exc), "rule_fragment", exc.code)
 
     return None
 

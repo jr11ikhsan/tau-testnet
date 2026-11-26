@@ -1069,12 +1069,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
     def _accumulating_rule_unit(tx: dict) -> Optional[str]:
         """The canonical unit this tx would add to the shared spec, or None.
 
-        Only an op-0 user_tx whose rule text passes the fragment screen
-        and is not an o5 clause (o5 registers, it does not accumulate).
-        The unit is the PREPROCESSED form -- the same canonical form the
-        accumulation stores -- so identical submissions dedup exactly as
-        the engine dedups them. A text the screen refuses can never
-        accumulate, so it costs nothing here.
+        Only an op-0 user_tx whose rule text parses as an always-unit or
+        a bare body and is not an o5 clause (o5 registers, it does not
+        accumulate). The unit is the PREPROCESSED form -- the same
+        canonical form the accumulation stores -- so identical submissions
+        dedup exactly as the engine dedups them. A text that parses as
+        neither form can never accumulate measurably, so it costs nothing
+        here (the compile gate judges it instead).
         """
         if tx.get("tx_type", "user_tx") != "user_tx":
             return None
@@ -1084,13 +1085,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         rule_text = operations.get("0")
         if not isinstance(rule_text, str) or not rule_text.strip():
             return None
-        from consensus.rule_fragment import FragmentError, parse_rule_fragment
+        from consensus.rule_fragment import FragmentError, parse_rule_fragment_or_body
         from consensus.shared_rule_budget import counts_toward_shared_budget
 
         if not counts_toward_shared_budget(rule_text):
             return None
         try:
-            parse_rule_fragment(rule_text)
+            parse_rule_fragment_or_body(rule_text)
         except FragmentError:
             return None
         try:
@@ -1205,7 +1206,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 if new_units:
                     from consensus.shared_rule_budget import (
                         SharedRuleBudget,
-                        parse_rule_fragment,
+                        parse_rule_fragment_or_body,
                     )
 
                     trial = SharedRuleBudget(
@@ -1215,7 +1216,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     )
                     over = None
                     for unit in sorted(new_units):
-                        info = parse_rule_fragment(unit)
+                        info = parse_rule_fragment_or_body(unit)
                         over = trial.would_exceed(info)
                         if over is not None:
                             break
@@ -4559,7 +4560,7 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 from consensus.shared_rule_budget import (
                                     SharedRuleBudget,
                                     counts_toward_shared_budget,
-                                    parse_rule_fragment,
+                                    parse_rule_fragment_or_body,
                                     recount_shared_budget,
                                     split_accumulated_units,
                                 )
@@ -4596,14 +4597,13 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         ):
                                             continue
                                         try:
-                                            _info = parse_rule_fragment(_unit)
+                                            _info = parse_rule_fragment_or_body(_unit)
                                         except _FragmentError:
                                             # A unit this tx did not add
                                             # (it predates the screen and
-                                            # fails it); the recount below
-                                            # skips it too. This tx's own
-                                            # unit passed the screen, so it
-                                            # always parses here.
+                                            # parses as neither an always-unit
+                                            # nor a bare body); the recount
+                                            # below skips it too.
                                             continue
                                         _over = _trial.would_exceed(_info)
                                         if _over is not None:

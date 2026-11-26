@@ -472,20 +472,7 @@ class _Parser:
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_rule_fragment(rule_text: str) -> FragmentInfo:
-    """Parse one rule fragment against the allow-list.
-
-    Raises ``FragmentError`` (with ``.code``) on anything outside the
-    grammar. On success returns the fragment's measured shape.
-    """
-    if not isinstance(rule_text, str) or not rule_text.strip():
-        raise FragmentError("an empty rule fragment is not allowed")
-    cleaned = _strip_comments(rule_text)
-    tokens = _tokenize(cleaned)
-    if not tokens:
-        raise FragmentError("an empty rule fragment is not allowed")
-    parser = _Parser(tokens)
-    ast = parser.parse_unit()
+def _finish(parser: "_Parser", ast: "_AST", rule_text: str) -> "FragmentInfo":
     nodes = _node_count(ast)
     depth = _node_depth(ast)
     if depth > MAX_FRAGMENT_DEPTH:
@@ -502,6 +489,87 @@ def parse_rule_fragment(rule_text: str) -> FragmentInfo:
         streams_written=tuple(sorted(parser.writes)),
         text=rule_text,
     )
+
+
+def is_always_unit(rule_text: str) -> bool:
+    """True when ``rule_text`` is shaped as one ``always ( ... )`` unit.
+
+    The syntax screen only judges that canonical shape (see
+    :func:`parse_rule_fragment`). Anything else -- a bare rule body
+    (``o12[t]:bv[24] = i1[t]:bv[24].``), opaque op-0 data
+    (``some_other_op_data``), a placeholder (``rule X``), garbage
+    (``invalid rule here``) -- is NOT a fragment the screen may refuse:
+    it passes through to the compile gate, which is the final judge and
+    owns the pinned codes (``TX_REJECTED``, ``ADMISSION_TIMEOUT``, ...).
+    """
+    if not isinstance(rule_text, str):
+        return False
+    cleaned = _strip_comments(rule_text).strip()
+    # The canonical form is `always (` -- `always` followed by an opening
+    # paren (whitespace allowed between). Anything else starting with the
+    # word (e.g. `always o12[t] := i9[t].`, the `:=` spelling the engine
+    # rejects at compile) is NOT an always-unit: it passes through to the
+    # compile gate, which owns its rejection code.
+    return re.match(r"always\s*\(", cleaned) is not None
+
+
+def parse_rule_fragment(rule_text: str) -> FragmentInfo:
+    """Parse one rule fragment against the allow-list.
+
+    Raises ``FragmentError`` (with ``.code``) on anything outside the
+    grammar. On success returns the fragment's measured shape.
+    """
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise FragmentError("an empty rule fragment is not allowed")
+    cleaned = _strip_comments(rule_text)
+    tokens = _tokenize(cleaned)
+    if not tokens:
+        raise FragmentError("an empty rule fragment is not allowed")
+    parser = _Parser(tokens)
+    ast = parser.parse_unit()
+    return _finish(parser, ast, rule_text)
+
+
+def parse_bare_body(rule_text: str) -> FragmentInfo:
+    """Parse a bare rule body (an expression with no ``always`` wrapper).
+
+    The node accepts bare bodies as user rules (e.g. the state
+    reconstruction tests apply ``o12[t]:bv[24] = i1[t]:bv[24].``), so
+    the budget recount must be able to measure them -- but the
+    admission screen must NOT refuse them (see :func:`is_always_unit`):
+    this function is for measurement only, never for rejection. The
+    node count has no ``always`` wrapper node (3 nodes for the example
+    above: ``=`` + two streams).
+    """
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise FragmentError("an empty rule fragment is not allowed")
+    cleaned = _strip_comments(rule_text)
+    tokens = _tokenize(cleaned)
+    if not tokens:
+        raise FragmentError("an empty rule fragment is not allowed")
+    parser = _Parser(tokens)
+    ast = parser._parse_ternary()
+    parser._accept(".")
+    if parser._peek() is not None:
+        raise FragmentError(
+            "a bare rule body must be a single expression; "
+            "trailing input is not allowed"
+        )
+    return _finish(parser, ast, rule_text)
+
+
+def parse_rule_fragment_or_body(rule_text: str) -> FragmentInfo:
+    """Parse either canonical form a user rule can take.
+
+    ``always ( ... )`` units via :func:`parse_rule_fragment`, bare
+    bodies via :func:`parse_bare_body`. Used by the budget machinery
+    (recount, header check, apply-time charge), which measures text
+    instead of rejecting it: a text that parses as neither form is
+    unmeasurable and is skipped there, never refused.
+    """
+    if is_always_unit(rule_text):
+        return parse_rule_fragment(rule_text)
+    return parse_bare_body(rule_text)
 
 
 def screen_rule_fragment(rule_text: str) -> Optional[str]:

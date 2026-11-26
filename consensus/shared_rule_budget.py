@@ -77,7 +77,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from consensus.rule_fragment import (
     FragmentError,
     FragmentInfo,
-    parse_rule_fragment,
+    parse_rule_fragment_or_body,
 )
 
 # --- Proposed limits ---------------------------------------------------------
@@ -328,12 +328,14 @@ def recount_shared_budget(
 ) -> Tuple[int, int]:
     """(count, nodes) of the accumulated text, derived, not incremented.
 
-    Parses each distinct unit with the fragment parser and sums the node
-    counts. Units that fail the parse are SKIPPED: the genesis seed and
-    grandfathered pre-package rules are not part of the counted spec (see
-    the module docstring). A unit that parses but is an o5 clause is also
-    skipped -- o5 text never accumulates in practice, but the recount must
-    not depend on that.
+    Parses each distinct unit with the fragment parser -- either the
+    canonical ``always ( ... )`` form or a bare rule body (the node
+    accepts bare bodies, e.g. ``o12[t]:bv[24] = i1[t]:bv[24].``) -- and
+    sums the node counts. Units that fail both parses are SKIPPED: the
+    genesis seed and grandfathered pre-package rules are not part of the
+    counted spec (see the module docstring). A unit that parses but is
+    an o5 clause is also skipped -- o5 text never accumulates in
+    practice, but the recount must not depend on that.
     """
     count = 0
     nodes = 0
@@ -341,7 +343,7 @@ def recount_shared_budget(
         if not counts_toward_shared_budget(unit):
             continue
         try:
-            info = parse_rule_fragment(unit)
+            info = parse_rule_fragment_or_body(unit)
         except FragmentError:
             continue
         count += 1
@@ -355,15 +357,17 @@ def check_shared_rule_budget(
     """Admission/apply verdict for one candidate rule against a budget.
 
     Returns an error string, or None when the rule may accumulate. A rule
-    that does not count toward the budget (o5) always passes; a rule that
-    fails the fragment parse is NOT a budget matter (the fragment screen
-    rejects it first with ``RULE_FRAGMENT``) and is reported as such here
-    so a caller that skipped the screen still refuses it.
+    that does not count toward the budget (o5) always passes. A rule that
+    parses as neither an ``always`` unit nor a bare body is NOT a budget
+    matter either: it is unmeasurable, the compile gate judges it, and
+    the recount skips it -- so the budget check must agree by passing it
+    (refusing it here as RULE_BUDGET would relabel the compile gate's
+    pinned codes, e.g. TX_REJECTED for ``invalid rule here``).
     """
     if not counts_toward_shared_budget(rule_text):
         return None
     try:
-        info = parse_rule_fragment(rule_text)
-    except FragmentError as exc:
-        return str(exc)
+        info = parse_rule_fragment_or_body(rule_text)
+    except FragmentError:
+        return None
     return budget.would_exceed(info)

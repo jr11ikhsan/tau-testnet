@@ -12,7 +12,10 @@ from consensus.rule_fragment import (
     RULE_FRAGMENT_CODE,
     TEMPORAL_REFERENCE_CODE,
     FragmentError,
+    is_always_unit,
+    parse_bare_body,
     parse_rule_fragment,
+    parse_rule_fragment_or_body,
     screen_rule_fragment,
 )
 
@@ -183,3 +186,71 @@ def test_rejected_fragments_carry_the_right_code(text, code):
 def test_screen_returns_text_not_exception():
     err = screen_rule_fragment("always ( foo[t] = 0 ).")
     assert isinstance(err, str) and "unknown stream" in err
+
+
+# --- Screen scope (regression, 2026-11-27) ----------------------------------
+# The admission screen judges ONLY the canonical `always ( ... )` form.
+# Op-0 is not always an always-unit: bare bodies, opaque data,
+# placeholders and garbage must pass the screen untouched so the compile
+# gate -- the final judge -- answers them with its pinned codes
+# (TX_REJECTED, ADMISSION_TIMEOUT, ...). Screening them relabelled all
+# of those as RULE_FRAGMENT and rejected live bare-body rules at apply
+# (17 failures in the 2026-11-27 full mock run).
+
+
+def test_is_always_unit_shapes():
+    assert is_always_unit("always (o26[t]:bv[24] = { 7 }:bv[24]).")
+    assert is_always_unit("always(o26[t]:bv[24] = { 7 }:bv[24]).")
+    assert is_always_unit("  always ( o5[t] = 1 ).")
+    assert is_always_unit("# note\nalways (o5[t] = 1).")
+    assert not is_always_unit("o12[t]:bv[24] = i1[t]:bv[24].")
+    assert not is_always_unit("invalid rule here")
+    assert not is_always_unit("some_other_op_data")
+    assert not is_always_unit("rule X")
+    assert not is_always_unit("alwaysx (o5[t] = 1).")
+    assert not is_always_unit("always o12[t] := i9[t].")  # no parens: not a unit
+    assert not is_always_unit("")
+
+
+def test_bare_body_parses_for_measurement_only():
+    info = parse_bare_body("o12[t]:bv[24] = i1[t]:bv[24].")
+    assert (info.nodes, info.depth, info.max_width) == (3, 2, 24)
+    assert info.streams_written == (12,)
+    assert info.streams_read == (1,)
+    with pytest.raises(FragmentError):
+        parse_bare_body("invalid rule here")
+    with pytest.raises(FragmentError):
+        parse_bare_body("o12[t]:bv[24] = i1[t]:bv[24]. extra")
+
+
+def test_parse_or_body_accepts_both_forms():
+    assert parse_rule_fragment_or_body(RULE_B).nodes == 4  # + wrapper
+    assert parse_rule_fragment_or_body(
+        "o12[t]:bv[24] = i1[t]:bv[24]."
+    ).nodes == 3  # no wrapper
+    with pytest.raises(FragmentError):
+        parse_rule_fragment_or_body("invalid rule here")
+
+
+def test_screen_passes_non_always_texts_to_the_compile_gate():
+    """The admission screen must not pre-empt the compile gate."""
+    from consensus.admission import screen_user_rule_text
+
+    for text in (
+        "invalid rule here",  # -> compile gate -> TX_REJECTED
+        "expensive_rule.",  # -> compile gate (may time out)
+        "some_other_op_data",  # opaque op-0 data, queues fine
+        "rule X",  # placeholder under mocks
+        "o12[t]:bv[24] = i1[t]:bv[24].",  # bare body the engine accepts
+    ):
+        assert screen_user_rule_text(text, "", False) is None, text
+    # ...while a malformed ALWAYS-unit is still refused here. (Note:
+    # "always ( foo[t] = 0 )." is refused EARLIER by the legacy
+    # special-stream screen with TX_REJECTED -- the fragment screen only
+    # sees texts the legacy screens pass, e.g. a non-constant product.)
+    rejection = screen_user_rule_text(
+        "always ( o13[t]:bv[24] = i1[t]:bv[24] * i2[t]:bv[24] ).", "", False
+    )
+    assert rejection is not None
+    assert rejection.code == RULE_FRAGMENT_CODE
+    assert screen_user_rule_text(RULE_B, "", False) is None
