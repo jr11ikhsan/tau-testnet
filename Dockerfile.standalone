@@ -5,7 +5,7 @@ FROM python:3.14-trixie AS tau-builder
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TAU_LANG_REPO=https://github.com/IDNI/tau-lang.git
 ARG TAU_LANG_REF=6ea436e8d3113a7d90635b9d06113e5bc506176c
-ARG TAU_BUILD_JOBS=4
+ARG TAU_BUILD_JOBS=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
