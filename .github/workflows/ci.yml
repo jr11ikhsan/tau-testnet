@@ -118,5 +118,6 @@ jobs:
           python -m pytest
           tests/test_recipient_controls_native.py
           tests/test_recipient_controls_twonode_native.py
+          tests/test_recipient_controls_twonode2_native.py
           -p no:asyncio -v
           "
