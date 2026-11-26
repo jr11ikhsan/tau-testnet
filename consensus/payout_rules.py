@@ -46,7 +46,22 @@ make two honest nodes disagree about admissibility, which forks.
   declared set, both caps, balance — so the clause decides and the node
   checks and applies; a clause that does not build, cannot be stepped, or
   writes a blocking o5 computes no legs and the execution settles
-  nothing, deterministically on every node. The book itself never steps
+  nothing, deterministically on every node.
+- A Tau-form clause MUST read at least one input stream of the execution
+  input map (`payout_clause_inputs`). The policy worker refuses to step a
+  clause that reads no input stream: its build probe reports "clause
+  cannot be evaluated: it reads no input stream", and a step attempt is
+  refused the same way. A constant clause — one whose outputs are all
+  literals — therefore can never settle an execution on the native engine,
+  however correct its arithmetic. It installs without complaint (there is
+  no install-time validation of steppability), but every execution of it
+  settles nothing, deterministically on every node. The clause that pays
+  an amount normally reads i1, the execution's submitted base amount: the
+  canonical paying form is `(o32[t]:bv[64] = i1[t]:bv[64])`, with the
+  caller passing the rule's amount as base. Constant clauses are only
+  usable in negative tests, where a step refusal and a book refusal are
+  indistinguishable; a positive settlement test must use a reading clause.
+  The book itself never steps
   a clause: callers (engine at apply, admission at the tip) step it and
   hand the decoded legs in, which keeps this module Tau-free and its
   decision path reusable verbatim at both sites.
@@ -460,6 +475,10 @@ def payout_clause_inputs(
       already paid in the period containing `ts`, from the book's recorded
       totals — the release-schedule input a grant or vesting clause
       computes its remaining allowance from
+
+    A clause that reads none of these streams cannot be stepped by the
+    policy worker at all (see the module docstring); a payout clause must
+    read at least one input stream.
 
     Nothing in the map comes from the execution transaction beyond the
     base amount: the map is node-built, so no submitter can steer the
