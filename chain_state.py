@@ -12,6 +12,7 @@ import tau_proposal
 import config
 import tau_native
 from consensus import TauConsensusEngine, TauStateSnapshot, compute_state_hash
+from consensus.shared_rule_budget import recount_shared_budget
 from consensus.lanes import TAU_EVALUATING_TX_TYPES
 from consensus.clause_registry import ClauseRegistry
 from consensus import faucet
@@ -580,6 +581,12 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
     merged_ts = dict(_last_transfer_ts)
     merged_ts.update(meta.get("last_transfer_ts", {}) or {})
     app_rules = next_snapshot.tau_bytes.decode("utf-8", errors="ignore")
+    # Cumulative shared-rule budget (G1): the counters are RECOUNTED from
+    # the snapshot's own application-rules text, not copied from the
+    # manager -- the recount is the authoritative derivation, so the
+    # committed rows can never disagree with the committed text (and a
+    # reorg, which rebuilds from snapshots, restores them for free).
+    _budget_count, _budget_nodes = recount_shared_budget(app_rules)
     return dict(
         head_hash=head_hash,
         head_num=head_num,
@@ -605,6 +612,13 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         rule_clauses=lm.rule_offers.clause_plan(),
         rule_policy_versions=lm.rule_offers.snapshot_policy_versions(),
         max_rule_txs_per_block=lm.max_rule_txs_per_block,
+        # Cumulative shared-rule budget (G1): the counters above are the
+        # recount of this snapshot's text; the limits travel as the
+        # manager's (governance-voted) object. The db rows are the durable
+        # record of both.
+        shared_rule_limits=lm.shared_rule_budget.limits.as_dict(),
+        shared_rule_count=_budget_count,
+        shared_rule_nodes=_budget_nodes,
         approval_requests=lm.approval_requests.snapshot_requests(),
         rule_change_requests=lm.approval_requests.snapshot_rule_change_requests(),
         approval_slots_active=lm.approval_slots_active,
@@ -613,6 +627,33 @@ def _canonical_state_kwargs(next_snapshot, *, head_hash, head_num) -> dict:
         fee_beneficiary=lm.fee_beneficiary,
         last_transfer_ts=merged_ts,
     )
+
+
+def _recount_shared_rule_budget(lm, application_rules_text: str) -> None:
+    """Set the manager's budget counters to the recount of the text (G1).
+
+    The counters are a DERIVATION of the canonical application-rules text,
+    not an independent ledger: whenever memory adopts a new text (block
+    swap, reorg rebuild, restart), the counters are recomputed from it.
+    If the manager already agreed, this is a no-op; if it did not, the
+    text wins and the disagreement is logged (it means a code path
+    charged a rule that never landed, or vice versa).
+    """
+    budget = getattr(lm, "shared_rule_budget", None)
+    if budget is None:
+        return
+    count, nodes = recount_shared_budget(application_rules_text)
+    if (count, nodes) != (budget.count, budget.nodes):
+        logger.warning(
+            "shared rule budget counters corrected from text: "
+            "was (%d rules, %d nodes), text recounts (%d rules, %d nodes)",
+            budget.count,
+            budget.nodes,
+            count,
+            nodes,
+        )
+    budget.count = count
+    budget.nodes = nodes
 
 
 def _swap_in_memory_state(next_snapshot, block) -> None:
@@ -638,6 +679,11 @@ def _swap_in_memory_state(next_snapshot, block) -> None:
 
         _tau_engine_state_hash = next_snapshot.state_hash
         _canonical_head_hash = block.block_hash
+
+        # Cumulative shared-rule budget (G1): the adopted manager's counters
+        # are re-derived from the adopted text, so a reorg (which rebuilds
+        # from snapshots) restores them exactly, with no increment to lose.
+        _recount_shared_rule_budget(_lifecycle_manager, _application_rules_state)
 
 
 def _sync_inprocess_consensus(prepared) -> None:
@@ -2368,6 +2414,58 @@ def load_state_from_db() -> bool:
                     "Ignoring malformed max_rule_txs_per_block chain_state entry %r",
                     persisted_budget,
                 )
+        # Cumulative shared-rule budget (G1): limits are restored from the
+        # durable row (a governance-voted change survives a restart);
+        # counters are RECOUNTED from the loaded application-rules text,
+        # never trusted from a stored row. Stored counter rows, when
+        # present, are cross-checked against the recount and a mismatch is
+        # logged (the text wins).
+        from consensus.shared_rule_budget import (
+            normalize_shared_rule_limits,
+            validate_shared_rule_limits,
+        )
+
+        persisted_limits = db.get_chain_state_value(
+            "shared_rule_limits", _MISSING
+        )
+        if persisted_limits != _MISSING:
+            try:
+                limits_obj = json.loads(persisted_limits)
+                limits_err = validate_shared_rule_limits(limits_obj)
+                if limits_err is not None:
+                    raise ValueError(limits_err)
+                _lifecycle_manager.shared_rule_budget.limits = (
+                    normalize_shared_rule_limits(limits_obj)
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                logger.warning(
+                    "Ignoring malformed shared_rule_limits chain_state "
+                    "entry %r; keeping the proposed default limits",
+                    persisted_limits,
+                )
+        _recount_shared_rule_budget(_lifecycle_manager, _application_rules_state)
+        for _key, _got in (
+            ("shared_rule_count", _lifecycle_manager.shared_rule_budget.count),
+            ("shared_rule_nodes", _lifecycle_manager.shared_rule_budget.nodes),
+        ):
+            _stored = db.get_chain_state_value(_key, _MISSING)
+            if _stored != _MISSING:
+                try:
+                    if int(_stored) != _got:
+                        logger.warning(
+                            "stored %s chain_state entry %r disagrees with "
+                            "the recount (%d) from the application-rules "
+                            "text; trusting the text",
+                            _key,
+                            _stored,
+                            _got,
+                        )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring malformed %s chain_state entry %r",
+                        _key,
+                        _stored,
+                    )
         _lifecycle_manager.recompute_approval_threshold()
 
         # Rehydrate rule sharing. Both structures are bound into
@@ -2442,6 +2540,16 @@ def commit_state_to_db(block_hash: str, block_number: int):
             _lifecycle_manager.rule_offers.snapshot_policy_versions()
         )
         max_rule_txs_snapshot = _lifecycle_manager.max_rule_txs_per_block
+        # Cumulative shared-rule budget (G1): counters are RECOUNTED from
+        # the application-rules text being committed (same derivation as
+        # _canonical_state_kwargs), so the durable rows always agree with
+        # the durable text. Limits travel as the manager's object.
+        _budget_count, _budget_nodes = recount_shared_budget(
+            app_rules_snapshot
+        )
+        shared_rule_limits_snapshot = (
+            _lifecycle_manager.shared_rule_budget.limits.as_dict()
+        )
         approval_requests_list = _lifecycle_manager.approval_requests.snapshot_requests()
         rule_change_requests_list = (
             _lifecycle_manager.approval_requests.snapshot_rule_change_requests()
@@ -2463,6 +2571,9 @@ def commit_state_to_db(block_hash: str, block_number: int):
         rule_clauses=rule_clauses_list,
         rule_policy_versions=rule_policy_versions_list,
         max_rule_txs_per_block=max_rule_txs_snapshot,
+        shared_rule_limits=shared_rule_limits_snapshot,
+        shared_rule_count=_budget_count,
+        shared_rule_nodes=_budget_nodes,
         approval_requests=approval_requests_list,
         rule_change_requests=rule_change_requests_list,
         approval_slots_active=approval_slots_active_snapshot,

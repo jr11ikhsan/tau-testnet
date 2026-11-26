@@ -121,6 +121,8 @@ from consensus.governance import (
     validate_fee_beneficiary,
     validate_approval_slots_active,
 )
+from consensus.rule_fragment import FragmentError, parse_rule_fragment
+from consensus.shared_rule_budget import SharedRuleBudget, check_shared_rule_budget
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +410,22 @@ def screen_user_rule_text(
             _width_mismatch_details(width_error) or {},
         )
 
+    # Syntax allow-list (G1): a fragment that passes every textual screen
+    # above can still be shaped in a way the engine was never meant to see
+    # (unknown streams, untyped braced constants, non-constant products,
+    # non-[t] steps the regex missed, garbage tokens). The structural
+    # parser refuses it here, before evaluation. This screen runs LAST on
+    # purpose: the rejection codes above (TX_REJECTED, TEMPORAL_REFERENCE,
+    # UNSCOPED_USER_RULE, WIDTH_MISMATCH) are pinned by existing tests, and
+    # an additive package must not relabel them. A text the old screens
+    # already refuse keeps its old reason; only a text that PASSES them and
+    # violates the allow-list gets RULE_FRAGMENT (or TEMPORAL_REFERENCE for
+    # a non-[t] step the parser finds first).
+    try:
+        parse_rule_fragment(rule_text)
+    except FragmentError as exc:
+        return UserRuleRejection(str(exc), "rule_fragment", exc.code)
+
     return None
 
 
@@ -492,6 +510,28 @@ def validate_user_tx_reserved_domains(tx: Dict, tip_view: TipAdmissionView) -> A
             return format_error(
                 rejection.error, code=rejection.code, **(rejection.details or {})
             )
+
+        # Cumulative shared-rule budget (G1): admission refuses a rule that
+        # would push the accumulated shared spec past the governance limits.
+        # Block apply enforces the same check (a proposer can include a tx
+        # that never passed admission), and the block header check refuses
+        # an over-budget block. An o5 rule never reaches this line: the
+        # routing above returns first (o5 registers a clause, it does not
+        # accumulate), and check_shared_rule_budget excludes o5 defensively.
+        # A tip view without chain state (unit tests) has no budget to
+        # count against, so the check is skipped there -- not failed.
+        budget = getattr(tip_view, "shared_rule_budget", None)
+        if isinstance(budget, SharedRuleBudget):
+            budget_error = check_shared_rule_budget(rule_text, budget)
+            if budget_error:
+                return format_error(
+                    budget_error,
+                    code="RULE_BUDGET",
+                    shared_rule_count=budget.count,
+                    shared_rule_nodes=budget.nodes,
+                    shared_rule_limit_occurrences=budget.limits.occurrences,
+                    shared_rule_limit_total_nodes=budget.limits.total_nodes,
+                )
 
     return success()
 
@@ -662,6 +702,14 @@ def _check_host_contract_patch(patch: dict, active_validators: Optional[Any] = N
         err = validate_fee_beneficiary(patch["fee_beneficiary"])
         if err:
             return f"Unsupported fee_beneficiary inside host_contract_patch: {err}"
+    if "shared_rule_limits" in patch:
+        # Cumulative shared-rule budget (G1): the patch must carry the
+        # complete 6-key limits object. The numbers are a GOVERNANCE
+        # PROPOSAL -- admission only checks shape/ranges, it does not
+        # decide the values.
+        err = validate_shared_rule_limits(patch["shared_rule_limits"])
+        if err:
+            return f"Unsupported shared_rule_limits inside host_contract_patch: {err}"
     return None
 
 

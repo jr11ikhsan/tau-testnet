@@ -139,5 +139,7 @@ jobs:
           tests/test_catchup_native.py
           tests/test_grant5000_bounty01.py
           tests/test_payout_periods_from_twonode_native.py
+          tests/test_rule_fragment_native.py
+          tests/test_tau_engine_profile_native.py
           -p no:asyncio -v
           "

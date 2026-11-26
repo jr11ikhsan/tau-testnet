@@ -48,6 +48,24 @@ class TipAdmissionView:
         return getattr(lm, "effective_eligibility_mode", lambda: "")()
 
     @property
+    def shared_rule_budget(self):
+        """Cumulative shared-rule budget at canonical tip (G1).
+
+        Returns the tip lifecycle manager's ``SharedRuleBudget`` (limits +
+        counters since genesis), or None when there is no chain state to
+        count against (unit tests driving admission without a tip). The
+        import is local: the budget module must stay importable without
+        this facade.
+        """
+        from consensus.shared_rule_budget import SharedRuleBudget
+
+        lm = getattr(chain_state, "_lifecycle_manager", None)
+        if lm is None:
+            return None
+        budget = getattr(lm, "shared_rule_budget", None)
+        return budget if isinstance(budget, SharedRuleBudget) else None
+
+    @property
     def next_block_height(self) -> int:
         """Returns the height that the next block would receive (tip + 1)."""
         latest_block = db.get_canonical_head_block()

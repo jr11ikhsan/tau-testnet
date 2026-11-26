@@ -140,10 +140,12 @@ def _encode_string_list(values: List[str], *, canonicalize: bool) -> bytes:
     return bytes(out)
 
 
-def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool, List[str]]]) -> bytes:
+def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool, List[str], Dict[str, int]]]) -> bytes:
     """
     Serialize host_contract_patch.
     Fields are ordered by key bytes in ascending lexicographic order.
+    A dict value (currently only the G1 `shared_rule_limits` limits object)
+    encodes as its canonical JSON string.
     """
     if not isinstance(patch, dict):
         raise ValueError("patch must be a dictionary")
@@ -165,6 +167,15 @@ def encode_host_contract_patch(patch: Dict[str, Union[int, str, bool, List[str]]
             v_bytes = b"\x03" + encode_string(v) # Type tag 3 for string
         elif isinstance(v, list):
             v_bytes = b"\x04" + _encode_string_list(v, canonicalize=k in VALIDATOR_DELTA_FIELDS)
+        elif isinstance(v, dict):
+            # Nested objects (currently only the G1 `shared_rule_limits`
+            # 6-key limits object) encode as their canonical JSON string
+            # (sorted keys, no whitespace) under the string tag. ADDITIVE:
+            # no previously-valid patch value changes encoding, so every
+            # existing update_id is unchanged; a dict previously raised.
+            v_bytes = b"\x03" + encode_string(
+                canonical_json(v).decode("utf-8")
+            )
         else:
             raise ValueError(f"Unsupported property type for key {k}: {type(v)}")
         encoded_pairs.append((k, k_bytes, v_bytes))

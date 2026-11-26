@@ -944,22 +944,33 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         rule_tx_budget = getattr(lm, "max_rule_txs_per_block", None)
         if isinstance(rule_tx_budget, bool) or not isinstance(rule_tx_budget, int):
             rule_tx_budget = DEFAULT_MAX_RULE_TXS_PER_BLOCK
+        # Cumulative shared-rule budget (G1) travels on the view, like the
+        # per-block budget above, so proposer and verifier read one
+        # authority -- the parent's counters + governance limits. A parent
+        # snapshot whose manager predates the field omits the keys, and
+        # the header check then skips (apply still enforces per-tx).
+        view_meta: dict = {
+            "poa": mode != "stake",
+            "eligibility_mode": mode,
+            "max_rule_txs_per_block": rule_tx_budget,
+            # Whether i18..i25 are reserved and fed. Read from the PARENT
+            # snapshot's manager, so an activation recorded in block H
+            # governs H+1 onward and never changes the meaning of the block
+            # that carried it.
+            "approval_slots_active": bool(
+                getattr(lm, "approval_slots_active", False)
+            ),
+        }
+        parent_budget = getattr(lm, "shared_rule_budget", None)
+        if parent_budget is not None:
+            view_meta["shared_rule_count"] = parent_budget.count
+            view_meta["shared_rule_nodes"] = parent_budget.nodes
+            view_meta["shared_rule_limits"] = parent_budget.limits.as_dict()
         return ActiveConsensusView(
             target_height=target_height,
             consensus_rules=str(parent_snapshot.metadata.get("consensus_rules_state", "") or ""),
             active_validators=[bytes.fromhex(v) for v in validator_hexes],
-            mechanism_specific_metadata={
-                "poa": mode != "stake",
-                "eligibility_mode": mode,
-                "max_rule_txs_per_block": rule_tx_budget,
-                # Whether i18..i25 are reserved and fed. Read from the PARENT
-                # snapshot's manager, so an activation recorded in block H
-                # governs H+1 onward and never changes the meaning of the block
-                # that carried it.
-                "approval_slots_active": bool(
-                    getattr(lm, "approval_slots_active", False)
-                ),
-            },
+            mechanism_specific_metadata=view_meta,
             parent_balances=parent_snapshot.metadata.get("balances"),
         )
 
@@ -1010,6 +1021,85 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         if not isinstance(rule_text, str) or not rule_text.strip():
             return False
         return tau_defs.USER_POLICY_STREAM_INDEX in clause_output_streams(rule_text)
+
+    @staticmethod
+    def _view_shared_rule_budget(active_view) -> Optional["SharedRuleBudget"]:
+        """Parent cumulative budget carried by the active view, or None.
+
+        Mirrors ``_view_rule_tx_budget``: the parent lifecycle manager's
+        counters + limits travel on the view (see
+        ``derive_active_consensus``) so proposer and verifier read one
+        authority. Absent or malformed fields mean the view predates the
+        budget, and the header check is skipped rather than failing every
+        block closed -- apply still refuses the individual txs.
+        """
+        from consensus.shared_rule_budget import (
+            SharedRuleBudget,
+            normalize_shared_rule_limits,
+            validate_shared_rule_limits,
+        )
+
+        meta = getattr(active_view, "mechanism_specific_metadata", None) or {}
+        if (
+            "shared_rule_count" not in meta
+            or "shared_rule_nodes" not in meta
+            or "shared_rule_limits" not in meta
+        ):
+            return None
+        count = meta.get("shared_rule_count")
+        nodes = meta.get("shared_rule_nodes")
+        limits = meta.get("shared_rule_limits")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            or isinstance(nodes, bool)
+            or not isinstance(nodes, int)
+            or nodes < 0
+            or validate_shared_rule_limits(limits) is not None
+        ):
+            return None
+        return SharedRuleBudget(
+            limits=normalize_shared_rule_limits(limits),
+            count=count,
+            nodes=nodes,
+        )
+
+    @staticmethod
+    def _accumulating_rule_unit(tx: dict) -> Optional[str]:
+        """The canonical unit this tx would add to the shared spec, or None.
+
+        Only an op-0 user_tx whose rule text passes the fragment screen
+        and is not an o5 clause (o5 registers, it does not accumulate).
+        The unit is the PREPROCESSED form -- the same canonical form the
+        accumulation stores -- so identical submissions dedup exactly as
+        the engine dedups them. A text the screen refuses can never
+        accumulate, so it costs nothing here.
+        """
+        if tx.get("tx_type", "user_tx") != "user_tx":
+            return None
+        operations = tx.get("operations")
+        if not isinstance(operations, dict):
+            return None
+        rule_text = operations.get("0")
+        if not isinstance(rule_text, str) or not rule_text.strip():
+            return None
+        from consensus.rule_fragment import FragmentError, parse_rule_fragment
+        from consensus.shared_rule_budget import counts_toward_shared_budget
+
+        if not counts_toward_shared_budget(rule_text):
+            return None
+        try:
+            parse_rule_fragment(rule_text)
+        except FragmentError:
+            return None
+        try:
+            import chain_state as _chain_state
+
+            unit = _chain_state._preprocess_tau_spec_text(rule_text)
+        except Exception:
+            unit = rule_text.strip()
+        return unit.strip() or None
 
     def verify_block_header(self, *args, **kwargs) -> bool:
         """
@@ -1085,6 +1175,58 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                         getattr(block.header, "block_number", "?"), rule_txs, budget,
                     )
                     return False
+
+            # Cumulative shared-rule budget (G1). A block whose rule txs
+            # would push the accumulated shared spec past the governance
+            # limits is invalid -- same consensus status as the per-block
+            # budget above. Counts only txs that WOULD accumulate: an op-0
+            # user_tx whose rule passes the fragment screen and is not an
+            # o5 clause (o5 registers, it does not accumulate). Identical
+            # texts inside one block count once (the accumulation dedups
+            # them). A view that predates these fields skips the check
+            # (apply still refuses the individual txs, so nothing can
+            # accumulate past the budget through a skipped check).
+            # Residual edge, documented: a tx repeating a unit ALREADY in
+            # the parent spec is over-counted by one here (the header check
+            # sees parent counters, not parent text), so a duplicate
+            # resubmission exactly at the occurrences boundary is refused
+            # as a block even though apply would accept it as a no-op.
+            # Fail-closed, bounded to the boundary case; the proposer
+            # rebuilds without the duplicate.
+            parent_budget = self._view_shared_rule_budget(active_view)
+            if parent_budget is not None:
+                new_units = set()
+                for tx in (getattr(block, "transactions", None) or []):
+                    if not isinstance(tx, dict):
+                        continue
+                    unit = self._accumulating_rule_unit(tx)
+                    if unit is not None:
+                        new_units.add(unit)
+                if new_units:
+                    from consensus.shared_rule_budget import (
+                        SharedRuleBudget,
+                        parse_rule_fragment,
+                    )
+
+                    trial = SharedRuleBudget(
+                        limits=parent_budget.limits,
+                        count=parent_budget.count,
+                        nodes=parent_budget.nodes,
+                    )
+                    over = None
+                    for unit in sorted(new_units):
+                        info = parse_rule_fragment(unit)
+                        over = trial.would_exceed(info)
+                        if over is not None:
+                            break
+                        trial.charge(info)
+                    if over is not None:
+                        logger.warning(
+                            "Consensus: block #%s would exceed the shared "
+                            "rule budget (%s)",
+                            getattr(block.header, "block_number", "?"), over,
+                        )
+                        return False
 
         if not _advisory_is_available() and not tau_manager.tau_ready.is_set():
             logger.error("Consensus: Tau not ready for block verification.")
@@ -4381,6 +4523,111 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 accepted_in_block = False
                                 hard_reject = True
                                 tx_receipt["reason"] = "rule_not_applied"
+
+                        # --- Cumulative shared-rule budget (G1) ---
+                        # The rule landed in canonical state above (staged
+                        # or live). Charge the newly added units to THIS
+                        # transaction's lifecycle fork
+                        # (``_lifecycle_for_write``): the fork is adopted
+                        # into the block lifecycle only if the tx stays
+                        # accepted, so a later rejection discards the charge
+                        # together with the fork -- the same rollback the W7
+                        # rule-state restore gives the text itself.
+                        # A proposer that bypassed admission is caught here:
+                        # a unit that would breach a per-rule or cumulative
+                        # limit hard-rejects the tx with reason
+                        # "shared_rule_budget", and the W7 rollback below
+                        # restores the prior application-rules text.
+                        # Replay is excluded: historical blocks restore
+                        # canonical state from the snapshot, and the swap
+                        # re-derives the counters from that text.
+                        if (
+                            _rule_touched_canonical
+                            and execution_success
+                            and accepted_in_block
+                            and not hard_reject
+                            and not replay_mode
+                        ):
+                            if _rule_prior_rules_state is None:
+                                logger.warning(
+                                    "shared rule budget: cannot determine "
+                                    "the newly added units (no prior rules "
+                                    "state); relying on the block-header "
+                                    "budget check for this transaction"
+                                )
+                            else:
+                                from consensus.shared_rule_budget import (
+                                    SharedRuleBudget,
+                                    counts_toward_shared_budget,
+                                    parse_rule_fragment,
+                                    recount_shared_budget,
+                                    split_accumulated_units,
+                                )
+                                from consensus.rule_fragment import (
+                                    FragmentError as _FragmentError,
+                                )
+
+                                _prior_units = set(
+                                    split_accumulated_units(
+                                        _rule_prior_rules_state
+                                    )
+                                )
+                                _new_units = [
+                                    unit
+                                    for unit in split_accumulated_units(
+                                        _rules_state()
+                                    )
+                                    if unit not in _prior_units
+                                ]
+                                _budget_mgr = _lifecycle_for_write()
+                                _budget = getattr(
+                                    _budget_mgr, "shared_rule_budget", None
+                                )
+                                if _budget is not None:
+                                    _trial = SharedRuleBudget(
+                                        limits=_budget.limits,
+                                        count=_budget.count,
+                                        nodes=_budget.nodes,
+                                    )
+                                    _over = None
+                                    for _unit in _new_units:
+                                        if not counts_toward_shared_budget(
+                                            _unit
+                                        ):
+                                            continue
+                                        try:
+                                            _info = parse_rule_fragment(_unit)
+                                        except _FragmentError:
+                                            # A unit this tx did not add
+                                            # (it predates the screen and
+                                            # fails it); the recount below
+                                            # skips it too. This tx's own
+                                            # unit passed the screen, so it
+                                            # always parses here.
+                                            continue
+                                        _over = _trial.would_exceed(_info)
+                                        if _over is not None:
+                                            break
+                                        _trial.charge(_info)
+                                    if _over is not None:
+                                        accepted_in_block = False
+                                        hard_reject = True
+                                        execution_success = False
+                                        tx_receipt["reason"] = (
+                                            "shared_rule_budget"
+                                        )
+                                        tx_receipt["logs"].append(
+                                            f"Error: shared rule budget: {_over}"
+                                        )
+                                    else:
+                                        # Counters are the recount of the
+                                        # working text, not the trial sum:
+                                        # the two agree by construction, and
+                                        # the recount is self-healing if a
+                                        # path ever charged without landing.
+                                        _budget.count, _budget.nodes = (
+                                            recount_shared_budget(_rules_state())
+                                        )
 
                 # --- Step 2 & 3: Unified Custom Inputs & Transfers ---
                 if execution_success and transfers_op_data is not None:

@@ -314,6 +314,16 @@ def main():
     # Built by the SAME function the runtime hash uses, so the two cannot drift.
     # Non-default fields are omitted, keeping a default genesis byte-identical to
     # one produced before those fields existed (hash-compat).
+    #
+    # Cumulative shared-rule budget (G1): this call deliberately passes NO
+    # budget arguments. The budget starts at 0 rules / 0 nodes with the
+    # GOVERNANCE-PROPOSED default limits (10 rules / 80 nodes -- see
+    # consensus/shared_rule_budget.py; the numbers are a proposal, not a
+    # decision), and build_mechanism_metadata emits the budget keys only
+    # once a rule has been counted or the limits differ from the proposal.
+    # A default genesis therefore hashes byte-identically to before this
+    # package: NO regenesis is required. The first counted rule binds the
+    # counters into the meta hash from then on.
     from consensus.governance import build_mechanism_metadata
     mech_meta = build_mechanism_metadata(
         args.vote_quorum, args.eligibility_mode, args.fee_beneficiary,

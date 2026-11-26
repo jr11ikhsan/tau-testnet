@@ -81,7 +81,26 @@ def load_tau_module():
     """
     Attempts to locate and import the native `tau` module.
     It searches in likely build directories within a sibling `tau-lang` repository.
+
+    Pinned engine profile (G1): before importing, the load environment is
+    scrubbed of anything that could steer the engine away from the tested
+    build (credentials, solver-binary PATH entries, unknown TAU_* vars),
+    and the tau-lang checkout the module was built from is checked against
+    the pinned ref (``consensus/engine_profile.py``). A verifiable ref
+    mismatch raises ``EngineProfileError`` and the engine does not start.
+    The import here is lazy on purpose: ``consensus`` imports this module
+    (via ``consensus.engine``), so a top-level import would be circular.
     """
+    # Lazy import: consensus.engine imports this module at ITS top level.
+    from consensus.engine_profile import (
+        EngineProfileError,
+        engine_profile,
+        scrub_engine_environment,
+        verify_pinned_engine_ref,
+    )
+
+    scrub_engine_environment()
+
     global tau, _native_tau_dir
     if tau is not None:
         return tau
@@ -123,6 +142,19 @@ def load_tau_module():
             _checked_tau_module(tau_module)
             tau = tau_module
             _native_tau_dir = found_path
+            # Pinned engine profile (G1): the module was built from the
+            # tau-lang checkout rooted above this build dir; verify it is
+            # the pinned ref before the engine starts serving.
+            _parts = found_path.split(os.sep)
+            if "tau-lang" in _parts:
+                _root = os.sep.join(
+                    _parts[: _parts.index("tau-lang") + 1]
+                )
+                verify_pinned_engine_ref(_root or None)
+                logger.info("engine profile: %s", engine_profile(_root or None))
+            else:
+                verify_pinned_engine_ref()
+                logger.info("engine profile: %s", engine_profile())
             return tau
         except ImportError as e:
             import glob
@@ -149,6 +181,10 @@ def load_tau_module():
         if mod_file:
             _native_tau_dir = os.path.dirname(os.path.abspath(mod_file))
         logger.info("Found native tau module in PYTHONPATH")
+        # Pinned engine profile (G1): no build dir to derive a checkout
+        # from here, so check the standard checkout locations.
+        verify_pinned_engine_ref()
+        logger.info("engine profile: %s", engine_profile())
         return tau
 
 # FD 1 is process-global, so StdOutCapture's save/redirect/restore cycle is a

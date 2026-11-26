@@ -4,12 +4,19 @@ import logging
 import re
 from dataclasses import dataclass
 
-from consensus.serialization import compute_update_id
+from consensus.serialization import canonical_json, compute_update_id
 from consensus.rule_offers import RuleOfferLifecycleManager
 from consensus.grants import GrantBook
 from consensus.payout_rules import PayoutRuleBook
 from consensus.receive_routes import ReceiveRouteBook
 from consensus.retractable import RetractableBook
+from consensus.shared_rule_budget import (
+    PROPOSED_SHARED_RULE_LIMITS,
+    SharedRuleBudget,
+    SharedRuleLimits,
+    normalize_shared_rule_limits,
+    validate_shared_rule_limits,
+)
 from consensus.standing_payments import StandingPaymentBook
 
 logger = logging.getLogger(__name__)
@@ -97,6 +104,10 @@ HOST_CONTRACT_PATCH_KEYS = frozenset({
     "fee_beneficiary",
     "max_rule_txs_per_block",
     "approval_slots_active",
+    # Cumulative shared-rule budget (G1): the governance-proposed limits on
+    # the accumulated shared spec. Complete 6-key object; see
+    # consensus/shared_rule_budget.py (numbers are a PROPOSAL, not decided).
+    "shared_rule_limits",
 })
 
 
@@ -207,6 +218,9 @@ def build_mechanism_metadata(
     payout_rules_root: str = "",
     grants_root: str = "",
     faucet_amount: int = 0,
+    shared_rule_limits: Optional[Dict[str, int]] = None,
+    shared_rule_count: int = 0,
+    shared_rule_nodes: int = 0,
 ) -> dict:
     """The `mechanism_specific_metadata` dict bound into the consensus meta hash.
 
@@ -277,6 +291,29 @@ def build_mechanism_metadata(
         mech["payout_rules_root"] = payout_rules_root
     if grants_root:
         mech["grants_root"] = grants_root
+    # Cumulative shared-rule budget (G1): same non-default gate as the keys
+    # above. The limits are emitted ONLY when they differ from the proposed
+    # defaults, and the counters ONLY once a rule has been counted, so a
+    # chain at genesis (0 rules, default limits) hashes exactly as it did
+    # before this package existed -- no regenesis. Once the first rule
+    # lands, both are bound into the meta hash; a node still running the
+    # old binary then diverges loudly (state-hash mismatch) rather than
+    # silently. gen_genesis calls this without them, so block 0 is unaffected.
+    # The limits travel as a canonical JSON STRING, not a dict: the meta-hash
+    # encoder only accepts int/str/bool/list values, and canonical_json
+    # (sorted keys, no whitespace) gives the object exactly one byte form.
+    # The db row stores the same JSON string; the in-memory view
+    # (derive_active_consensus) keeps the dict form, which is NOT hashed.
+    if shared_rule_limits is not None and (
+        dict(shared_rule_limits) != PROPOSED_SHARED_RULE_LIMITS
+    ):
+        mech["shared_rule_limits"] = canonical_json(
+            dict(shared_rule_limits)
+        ).decode("utf-8")
+    if shared_rule_count:
+        mech["shared_rule_count"] = shared_rule_count
+    if shared_rule_nodes:
+        mech["shared_rule_nodes"] = shared_rule_nodes
     return mech
 
 
@@ -481,6 +518,15 @@ class ConsensusLifecycleManager:
         # interpreter rebuilds a validator must pay to verify one block.
         # Governance-patchable; bound into the meta hash only when non-default.
         self.max_rule_txs_per_block: int = DEFAULT_MAX_RULE_TXS_PER_BLOCK
+        # Cumulative shared-rule budget (G1). A FIELD for the same reason
+        # rule_offers is: the engine wires admission/apply against the
+        # manager every node already shares, fork()/adopt() carry it per
+        # transaction/block, and consensus_meta_hash binds its limits (when
+        # non-default) and counters (once non-zero). Limits are the
+        # GOVERNANCE-PROPOSED defaults until a patch votes otherwise;
+        # counters start at 0 at genesis (the genesis seed rule is not a
+        # user rule and is never counted).
+        self.shared_rule_budget = SharedRuleBudget()
 
         # Co-signature approvals. A FIELD for the same reason rule_offers is.
         self.approval_requests = ApprovalRequestLifecycleManager()
@@ -618,6 +664,9 @@ class ConsensusLifecycleManager:
                 "" if self.grants.is_empty() else self.grants.root().hex()
             ),
             faucet_amount=self.faucet_amount,
+            shared_rule_limits=self.shared_rule_budget.limits.as_dict(),
+            shared_rule_count=self.shared_rule_budget.count,
+            shared_rule_nodes=self.shared_rule_budget.nodes,
         )
         return compute_consensus_meta_hash(
             host_contract={},
@@ -700,6 +749,24 @@ class ConsensusLifecycleManager:
             if err:
                 raise ValueError(f"max_rule_txs_per_block: {err}")
             self.max_rule_txs_per_block = int(budget)
+
+        if "shared_rule_limits" in patch:
+            # Cumulative shared-rule budget (G1). Same "only
+            # consensus-binding validation" reasoning as fee_beneficiary:
+            # admission screens the patch, but block apply reaches here
+            # without it, so validate completely. The patch replaces the
+            # LIMITS ONLY -- the counters are never touched by a patch.
+            # Lowering a limit below current usage does not evict rules
+            # already accumulated; it only refuses the next rule that
+            # would exceed it. The numbers in the default object are a
+            # GOVERNANCE PROPOSAL, not a maintainer decision.
+            limits = patch["shared_rule_limits"]
+            err = validate_shared_rule_limits(limits)
+            if err:
+                raise ValueError(f"shared_rule_limits: {err}")
+            self.shared_rule_budget.limits = normalize_shared_rule_limits(
+                limits
+            )
 
         if "approval_slots_active" in patch:
             # Same "only consensus-binding validation" reasoning as
