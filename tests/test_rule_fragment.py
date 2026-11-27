@@ -44,9 +44,18 @@ GENESIS_CONSENSUS = (
     "    o9[t]:bv[24] = { #x00000a }:bv[24]\n)\n"
 )
 # Typed effect-1 rule from issue #183 (cross-account fee rule).
+# NOTE (2026-11-27): `i1` is annotated bv[24] here -- NOT bv[64] -- because
+# the native harness compiles this fragment against an accumulated spec
+# whose BASE rule types i1 as bv[24] (`o1[t]:bv[24] = i1[t]:bv[24]`); a
+# bv[64] annotation on i1 conflicts with the accumulated spec and the
+# pinned engine rejects it (type inference, fail-closed). The screen
+# judges shape in isolation and does not re-enforce width policy, so the
+# fragment itself must carry the width the harness context assigns to i1.
+# The substitution is byte-length preserving (bv[64] -> bv[24]), so the
+# pinned byte_len 146 below is unchanged.
 EFFECT_1_TYPED = (
     "always ( ((i12[t]:bv[384] = { #xaa }:bv[384] || "
-    "i1[t]:bv[64] > { 0 }:bv[64]) "
+    "i1[t]:bv[24] > { 0 }:bv[24]) "
     "? (o8[t]:bv[64] = { 100 }:bv[64]) : "
     "(o8[t]:bv[64] = { 0 }:bv[64])) )."
 )

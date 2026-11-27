@@ -100,12 +100,18 @@ def _assert_ok(proc, parsed):
 
 
 # Rules the allow-list admits (shapes from tests/test_rule_fragment.py).
+# NOTE (2026-11-27): each fragment must be consistent with the ACCUM typing
+# below -- BASE types i1 as bv[24], so `effect_1_typed` annotates i1 bv[24],
+# not bv[64] (a bv[64] annotation conflicts with the accumulated spec and
+# the pinned engine rejects it; the screen judges shape in isolation and
+# does not re-enforce width policy, so the fragment carries the width the
+# harness context assigns). See G1-FIX-2026-11-27.md §1.
 ADMITTED = {
     "rule_b": "always (o26[t]:bv[24] = { 7 }:bv[24]).",
     "rule_o8": "always (o8[t]:bv[64] = { 100 }:bv[64]).",
     "effect_1_typed": (
         "always ( ((i12[t]:bv[384] = { #xaa }:bv[384] || "
-        "i1[t]:bv[64] > { 0 }:bv[64]) "
+        "i1[t]:bv[24] > { 0 }:bv[24]) "
         "? (o8[t]:bv[64] = { 100 }:bv[64]) : "
         "(o8[t]:bv[64] = { 0 }:bv[64])) )."
     ),
@@ -167,9 +173,31 @@ emit(res)
 
 
 @requires_native
-def test_engine_also_rejects_a_special_stream_rule(tmp_path):
-    """Belt-and-braces: a rule the screen refuses for naming `u` is not
-    something the engine would have run either."""
+def test_u_writing_rule_refused_by_screen_not_engine(tmp_path):
+    """The refusal of a `u`-writing rule lives in the screens, not the engine.
+
+    `u` is the engine's spec-update stream (writing it revises the running
+    spec itself): the legacy special-stream screen refuses it with
+    TX_REJECTED (consensus/admission.py: screen_stream_names) and the
+    fragment screen refuses it with RULE_FRAGMENT_CODE (`u` is not an
+    i<N>/o<N> stream). The raw engine compile gate, however, accepts
+    `always u[t] = 0.` silently -- it is an engine-special stream, so the
+    compile gate has no reason to refuse it. The old test assumed the
+    engine refused it too; that assumption was wrong (run 45930209937).
+    The belt-and-braces property that actually holds is: the screens
+    refuse, so the engine is never reached.
+    """
+    # Screen side (no native needed): both screens refuse `u`.
+    from consensus.admission import screen_user_rule_text
+    from consensus.rule_fragment import FragmentError, parse_rule_fragment
+
+    with pytest.raises(FragmentError) as excinfo:
+        parse_rule_fragment("always u[t] = 0.")
+    assert excinfo.value.code == "RULE_FRAGMENT"
+    rejection = screen_user_rule_text("always u[t] = 0.", "", False)
+    assert rejection is not None and rejection.code == "TX_REJECTED"
+    # Engine side (native): the compile gate accepts it silently -- document
+    # the behaviour instead of assuming a rejection.
     proc, parsed = _run_child(tmp_path, "frag_u", r'''
 res = {}
 ACCUM = ("always ( " + ROUTER + " ).\n"
@@ -182,4 +210,8 @@ res["u_rule"] = tau_native.strip_ansi(r) if r else None
 emit(res)
 ''')
     _assert_ok(proc, parsed)
-    assert parsed["u_rule"], "engine silently accepted a `u`-writing rule"
+    assert parsed["u_rule"] is None, (
+        "engine now rejects a `u`-writing rule; the screen-side refusal "
+        "above is still the gate, but update this note: "
+        f"{parsed['u_rule']}"
+    )
