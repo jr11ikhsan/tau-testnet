@@ -404,8 +404,103 @@ def _refund_expired_grants(lm, balances, sequences, timestamp) -> List[Dict[str,
     return events
 
 
+def _standing_retry_transfer_inputs(
+    payer_pubkey, recipient_pubkey, amount, payer_balance, timestamp
+):
+    """The per-transfer input map for a standing-retry o5 check.
+
+    The same field meanings as the apply-side `_transfer_input_map`
+    (i1 amount, i2 payer balance, i3 payer, i4 recipient, i5 block
+    timestamp, i12 payer) — the values an o5 clause reads. Two fields
+    are deliberately absent: i16 (cooldown) and i17 (standing-paid
+    current period). A retry is node-driven — there is no executor,
+    no cooldown context, and no per-sender current-period fact at
+    this layer — so feeding a guessed value would be worse than
+    omitting it: a clause that reads an absent stream sees nothing
+    to allow on, and `clause_blocks` fails closed on a clause it
+    cannot step. i2 is the balance the block has reached (the same
+    value the retry run itself uses), not the parent snapshot: the
+    proposer and the verifier compute the sweep after the same
+    block's transactions, so both read the same i2.
+    """
+    return {
+        1: str(int(amount)),
+        2: str(int(payer_balance)),
+        3: "{ #x" + str(payer_pubkey) + " }:bv[384]",
+        4: "{ #x" + str(recipient_pubkey) + " }:bv[384]",
+        12: "{ #x" + str(payer_pubkey) + " }:bv[384]",
+        5: str(int(timestamp)),
+    }
+
+
+def _standing_retry_blocked_by_o5(
+    lm, session, payer_pubkey, recipient_pubkey, amount, payer_balance,
+    timestamp, *, replay_mode=False,
+):
+    """(blocked, reason) — the payer's CURRENT o5 against one retry leg.
+
+    L7 (Bounty 01, issue #34 acceptance case 7): "Execution must
+    re-check the payer's currently active transfer policy (o5)...
+    so a later freeze or stricter guard can stop it." A retry is an
+    execution, so it faces the same two gates the transfer seam
+    applies, in the same order:
+
+    1. The Tau o5 stream: the transfer inputs evaluated against the
+       live rules — BLOCK blocks, absent allows, unparseable fails
+       closed (parse_tau_output maps it to 0). Only when a session
+       is available; without one the check is skipped and the clause
+       gate below still applies.
+    2. The payer's own o5 clause: `rule_offers.clause_for` read at
+       the tip, evaluated over the same input map by
+       `sender_policy.clause_blocks`. Absent policy allows; a clause
+       that does not build, or that the engine refuses to step,
+       blocks (clause_blocks fails closed).
+
+    A manager that carries no rule book cannot show the payer's
+    policy — that is a fail-closed block, never a silent allow.
+    A session that is present but not ready raises FeeRuleError
+    outside replay (the seam's strictness: never guess a policy
+    verdict); in replay it is a block, the parked-measurement
+    concession — every replaying node reaches the same verdict.
+    """
+    inputs = _standing_retry_transfer_inputs(
+        payer_pubkey, recipient_pubkey, amount, payer_balance, timestamp,
+    )
+    if session is not None:
+        if not session.ready(timeout=5):
+            if replay_mode:
+                return True, "user_policy_block"
+            raise FeeRuleError(
+                "Tau unavailable checking the payer's current o5 "
+                "for a standing retry"
+            )
+        with tau_manager.tau_comm_lock:
+            tau_outputs = session.evaluate(
+                inputs, multi=True, apply_rules_update=False,
+            )
+        o5_raw = tau_outputs.get(tau_defs.USER_POLICY_STREAM_INDEX)
+        if o5_raw is not None and \
+                tau_manager.parse_tau_output(o5_raw) == tau_defs.USER_POLICY_BLOCK_VALUE:
+            return True, "user_policy_block"
+    offers = getattr(lm, "rule_offers", None)
+    if offers is None:
+        return True, "user_policy_block"
+    own_blocks, _own_o5 = sender_policy.clause_blocks(
+        offers.clause_for(payer_pubkey, tau_defs.USER_POLICY_STREAM_INDEX),
+        inputs, pool="apply",
+        timeout=(
+            getattr(session, "request_budget", None)
+            if session is not None else None
+        ),
+    )
+    if own_blocks:
+        return True, "user_policy_block"
+    return False, ""
+
+
 def _retry_due_standing_payments(
-    lm, balances, sequences, height, timestamp
+    lm, balances, sequences, height, timestamp, session=None,
+    replay_mode=False,
 ) -> List[Dict[str, Any]]:
     """Run owed standing-payment retries; notice newly short due points.
 
@@ -421,8 +516,13 @@ def _retry_due_standing_payments(
        one at the due point: no executor, the balance the block has
        reached (after this block's transactions and grant refunds),
        the rule's caps. It settles fee-free, like every sweep
-       movement. Still short, it stays owed for the next block; any
-       other refusal drops it.
+       movement. Before the book settles a retry, the payer's
+       currently active o5 is re-checked on the real recipient and
+       amount of every leg (L7, #34 acceptance case 7) — the same
+       two gates the transfer seam applies; a retry the policy now
+       blocks is dropped, and the period stays unsettled for a later
+       explicit execution. Still short, it stays owed for the next
+       block; any other refusal drops it.
     3. Discover newly short due points: for every Tau-form
        authorization carrying a retry term, evaluate each due, unpaid
        period inside its retry window. One found short is recorded
@@ -436,7 +536,9 @@ def _retry_due_standing_payments(
     competitor's node-side due-point run does. A due point the node
     finds payable is left alone: settling un-attempted due points is
     the node sweep's job (FIX 3, awaiting the o5 decision), not the
-    retry's. Retries do not wake an idle chain: this runs only when
+    retry's. (L7: the retry itself now re-checks the payer's current
+    o5 before settling, per #34 acceptance case 7; a blocked retry
+    is dropped. FIX 3 still awaits its own o5 decision.) Retries do not wake an idle chain: this runs only when
     apply_block runs, i.e. when a block is produced.
     """
     book = _standing_payment_book(lm)
@@ -493,6 +595,32 @@ def _retry_due_standing_payments(
         if legs is None:
             # The clause did not build: no run happened, the retry
             # stays owed — the window, not an engine failure, ends it.
+            continue
+        # L7: a retry is a payment, so the payer's CURRENT o5 is
+        # re-checked on the real recipient and amount of every leg
+        # before the book may settle it — the same gates the
+        # transfer seam applies (#34 acceptance case 7). A retry the
+        # policy now blocks is DROPPED, like any other non-shortfall
+        # refusal: the period stays unsettled, so it may still be
+        # paid later by explicit execution once the freeze lifts.
+        o5_blocked = False
+        o5_reason = ""
+        for leg_recipient, leg_amount in legs:
+            o5_blocked, o5_reason = _standing_retry_blocked_by_o5(
+                lm, session, entry.payer_pubkey, leg_recipient, leg_amount,
+                payer_balance, ts, replay_mode=replay_mode,
+            )
+            if o5_blocked:
+                break
+        if o5_blocked:
+            book.drop_retry(retry.auth_id, retry.period_index)
+            attempted += 1
+            events.append({
+                "auth_id": entry.auth_id.hex(),
+                "action": "due_retry_ended",
+                "period_index": retry.period_index,
+                "reason": o5_reason,
+            })
             continue
         decision = book.execute_retry(retry, ts, payer_balance, legs)
         attempted += 1
@@ -1334,6 +1462,16 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         retried_standing = _retry_due_standing_payments(
             lm, t_bals, t_seqs,
             block.header.block_number, block.header.timestamp,
+            # L7: the sweep re-checks the payer's current o5, so it
+            # needs the session apply() just drove — the same session
+            # the transfer seam evaluated against. Without one the
+            # Tau-stream gate is skipped and the own-clause gate
+            # still applies.
+            session=(
+                session if session is not None
+                else getattr(proposal, "session", None)
+            ),
+            replay_mode=replay_mode,
         )
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
